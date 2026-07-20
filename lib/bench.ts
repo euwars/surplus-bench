@@ -52,6 +52,129 @@ export type ProgressEvent =
   | { type: "skipped"; run: Run }
   | { type: "error"; error: string };
 
+type ModelRates = { prompt: number; completion: number; cacheRead: number };
+let pricingCache: Map<string, ModelRates> | null = null;
+
+/** Load $/token rates from Surplus /models — used when the completion body omits cost. */
+async function loadPricing(key: string): Promise<Map<string, ModelRates>> {
+  if (pricingCache) return pricingCache;
+  const map = new Map<string, ModelRates>();
+  try {
+    const res = await fetch(`${SURPLUS_URL}/models`, {
+      headers: { Authorization: `Bearer ${key}` },
+      cache: "no-store",
+    });
+    const data = (await res.json()) as { data?: Array<{ id: string; pricing?: Record<string, string> }> };
+    for (const m of data.data ?? []) {
+      const p = m.pricing;
+      if (!p) continue;
+      map.set(m.id, {
+        prompt: Number(p.prompt) || 0,
+        completion: Number(p.completion) || 0,
+        cacheRead: Number(p.input_cache_read) || Number(p.prompt) || 0,
+      });
+    }
+  } catch {
+    /* fall through with empty map */
+  }
+  pricingCache = map;
+  return map;
+}
+
+/**
+ * Surplus returns cost in several shapes:
+ * - number on usage.cost (some sellers)
+ * - { usd, diem } on the response root (many sellers leave usd=0 and put the
+ *   real amount in diem — empirically matches published $/token × usage)
+ */
+function parseCostUSD(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+  if (v && typeof v === "object") {
+    const o = v as { usd?: unknown; diem?: unknown; cost?: unknown };
+    if (typeof o.usd === "number" && Number.isFinite(o.usd) && o.usd > 0) return o.usd;
+    if (typeof o.diem === "number" && Number.isFinite(o.diem) && o.diem > 0) return o.diem;
+    if (typeof o.cost === "number" && Number.isFinite(o.cost) && o.cost > 0) return o.cost;
+  }
+  return null;
+}
+
+function estimateCostUSD(
+  model: string,
+  tokensIn: number,
+  tokensOut: number,
+  cacheRead: number,
+  rates: Map<string, ModelRates>,
+): number | null {
+  const r = rates.get(model);
+  if (!r || (r.prompt <= 0 && r.completion <= 0)) return null;
+  const cached = Math.min(Math.max(0, cacheRead), Math.max(0, tokensIn));
+  const uncached = Math.max(0, tokensIn - cached);
+  const usd = uncached * r.prompt + cached * r.cacheRead + Math.max(0, tokensOut) * r.completion;
+  return usd > 0 ? usd : null;
+}
+
+/**
+ * Prefer billed cost from the API, else estimate from published model rates × tokens.
+ * Surplus often puts cost at the response root (not inside usage), which the AI SDK
+ * drops unless we capture it via metadataExtractor.
+ */
+function resolveCostUSD(opts: {
+  model: string;
+  usage: any;
+  providerMetadata?: any;
+  rates: Map<string, ModelRates>;
+}): number | null {
+  const raw = opts.usage?.raw;
+  const fromUsage = parseCostUSD(raw?.cost) ?? parseCostUSD(opts.usage?.cost);
+  if (fromUsage != null) return fromUsage;
+
+  const meta = opts.providerMetadata?.surplus ?? opts.providerMetadata;
+  const fromMeta = parseCostUSD(meta?.cost);
+  if (fromMeta != null) return fromMeta;
+
+  const tokensIn =
+    (typeof opts.usage?.inputTokens === "number" ? opts.usage.inputTokens : null) ??
+    raw?.prompt_tokens ??
+    0;
+  const tokensOut =
+    (typeof opts.usage?.outputTokens === "number" ? opts.usage.outputTokens : null) ??
+    raw?.completion_tokens ??
+    0;
+  const cacheRead =
+    opts.usage?.inputTokenDetails?.cacheReadTokens ??
+    raw?.prompt_tokens_details?.cached_tokens ??
+    0;
+  return estimateCostUSD(opts.model, tokensIn, tokensOut, cacheRead, opts.rates);
+}
+
+function roundCost(usd: number | null): number {
+  if (usd == null || !Number.isFinite(usd)) return 0;
+  return Math.round(usd * 1e8) / 1e8; // 8 dp — tiny per-call costs need precision
+}
+
+// Pull top-level `cost` off Surplus responses into providerMetadata.surplus.
+// Cast: Surplus cost shapes ({usd,diem} | number) aren't in SharedV4 JSONObject strictly.
+const surplusMetadataExtractor = {
+  async extractMetadata({ parsedBody }: { parsedBody: unknown }) {
+    const cost = (parsedBody as { cost?: unknown } | null)?.cost;
+    if (cost == null) return undefined;
+    return { surplus: { cost: cost as never } };
+  },
+  createStreamExtractor() {
+    let cost: unknown;
+    return {
+      processChunk(parsedChunk: unknown) {
+        const c = (parsedChunk as { cost?: unknown } | null)?.cost;
+        if (c != null) cost = c;
+      },
+      buildMetadata() {
+        if (cost == null) return undefined;
+        return { surplus: { cost: cost as never } };
+      },
+    };
+  },
+};
+
 function provider(key: string) {
   return createOpenAICompatible({
     name: "surplus",
@@ -59,6 +182,7 @@ function provider(key: string) {
     apiKey: key,
     supportsStructuredOutputs: true,
     includeUsage: true,
+    metadataExtractor: surplusMetadataExtractor as any,
   });
 }
 
@@ -157,9 +281,9 @@ function diagnose(e: unknown): {
     const fr = (e.finishReason as string | undefined) ?? null;
     const usage = {
       finishReason: fr,
-      tokensOut: u.outputTokens ?? 0,
+      tokensOut: u.outputTokens ?? u.raw?.completion_tokens ?? 0,
       reasoningTokens,
-      costUSD: Math.round((u.raw?.cost ?? 0) * 1e6) / 1e6,
+      costUSD: roundCost(parseCostUSD(u.raw?.cost) ?? parseCostUSD(u.cost)),
       rawPreview: text ? text.slice(0, 2000) : null,
     };
 
@@ -307,15 +431,23 @@ async function attempt(model: string, key: string): Promise<Result> {
 
       const usage: any = r.usage;
       const duration = (Date.now() - t0) / 1000;
-      const tokensIn = usage.inputTokens ?? 0;
-      const tokensOut = usage.outputTokens ?? 0;
+      const tokensIn = usage.inputTokens ?? usage.raw?.prompt_tokens ?? 0;
+      const tokensOut = usage.outputTokens ?? usage.raw?.completion_tokens ?? 0;
       const reasoningTokens =
         usage.outputTokenDetails?.reasoningTokens ??
         usage.raw?.completion_tokens_details?.reasoning_tokens ??
         0;
       const contentTokens = Math.max(0, tokensOut - reasoningTokens);
       const tokPerSec = duration > 0.3 ? Math.round(contentTokens / duration) : null;
-      const costUSD = usage.raw?.cost ?? 0;
+      const rates = await loadPricing(key);
+      const costUSD = roundCost(
+        resolveCostUSD({
+          model,
+          usage,
+          providerMetadata: (r as any).providerMetadata,
+          rates,
+        }),
+      );
       const finishReason =
         (r as any).finishReason ??
         (r as any).response?.finishReason ??
@@ -338,7 +470,7 @@ async function attempt(model: string, key: string): Promise<Result> {
         thinkingVisible: false,
         reasoningEffort: REASONING_EFFORT,
         tokPerSec,
-        costUSD: Math.round(costUSD * 1e6) / 1e6,
+        costUSD,
       };
     } catch (e: any) {
       const aborted =
@@ -352,13 +484,20 @@ async function attempt(model: string, key: string): Promise<Result> {
         });
       }
       const d = diagnose(e);
+      const rates = await loadPricing(key);
+      const u: any = NoObjectGeneratedError.isInstance(e) ? (e as any).usage : null;
+      const costUSD = roundCost(
+        (d.costUSD > 0 ? d.costUSD : null) ??
+          resolveCostUSD({ model, usage: u ?? { raw: null }, rates }),
+      );
       return failResult(model, t0, d.note, {
         finishReason: d.finishReason,
         failKind: d.failKind,
         rawPreview: d.rawPreview,
-        tokensOut: d.tokensOut,
+        tokensIn: u?.inputTokens ?? u?.raw?.prompt_tokens ?? 0,
+        tokensOut: d.tokensOut || (u?.outputTokens ?? 0),
         reasoningTokens: d.reasoningTokens,
-        costUSD: d.costUSD,
+        costUSD,
         thinking: d.reasoningTokens > 0,
       });
     }

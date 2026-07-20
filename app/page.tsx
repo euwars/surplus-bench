@@ -271,9 +271,10 @@ export default function Page() {
             <p className="eyebrow">Surplus · structured output</p>
             <h1>Model benchmark</h1>
             <p className="lede">
-              Reliability, latency, reasoning, and cost — same prompt and{" "}
-              <code className="inline-code">json_schema</code> for every model. Fail often means the
-              seller ignored strict schema (free-form JSON / prose) rather than a model “being dumb.”
+              Long structured diligence report (same prompt +{" "}
+              <code className="inline-code">json_schema</code> for every model) so tok/s is measured
+              over a large JSON payload — not a tiny extraction. Fail usually means the seller
+              ignored strict schema, not that the model “is dumb.”
             </p>
           </div>
           <button className="btn-primary" onClick={() => trigger()} disabled={running || !data}>
@@ -496,13 +497,7 @@ export default function Page() {
                             "—"
                           )}
                         </td>
-                        <td className="num">
-                          {!isLive && r
-                            ? r.costUSD
-                              ? `$${r.costUSD.toFixed(4)}`
-                              : "—"
-                            : "—"}
-                        </td>
+                        <td className="num">{!isLive && r ? fmtCost(r.costUSD) : "—"}</td>
                         <td>
                           {relPct !== null ? (
                             <span className="rel">
@@ -1302,4 +1297,12 @@ function fmtAge(s: number) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   return `${Math.round(s / 3600)}h`;
+}
+
+/** Show small per-call costs (often well under $0.01). */
+function fmtCost(c: number | null | undefined) {
+  if (c == null || !Number.isFinite(c) || c <= 0) return "—";
+  if (c < 0.0001) return `$${c.toFixed(6)}`;
+  if (c < 0.01) return `$${c.toFixed(5)}`;
+  return `$${c.toFixed(4)}`;
 }
