@@ -41,12 +41,26 @@ import { z } from "zod";
 // Prompt field names MUST match TaskSchema keys exactly. English paraphrases
 // ("company name", "raise amount") train free-form sellers to invent
 // company_name / raise_amount_usd and fail schema validation.
+/** System instruction: strict output contract, separate from the user note. */
+export const SYSTEM =
+  "You are a JSON extraction API. " +
+  "Respond with one JSON object only — no markdown, no ``` fences, no commentary. " +
+  "Keys must be exactly: company (string), stage (preSeed|seed|seriesA|seriesB|later), " +
+  "raiseUsd (number), risks (non-empty string array). " +
+  "Never rename keys. Never wrap the object in a code block.";
+
 export const PROMPT =
-  'Extract fields company, stage, raiseUsd, risks from this note. ' +
-  'Note: "Convexity is an AI-native ERP raising $1,000,000 at the seed stage. ' +
-  'Risks: revenue is unverified, and the CTO is still employed at Microsoft." ' +
-  "stage must be one of: preSeed | seed | seriesA | seriesB | later. " +
-  "raiseUsd is a number (USD). risks is a non-empty string array.";
+  "Extract from this note into the required JSON object. " +
+  "Reply with raw JSON only (no markdown, no fences, no prose). " +
+  "Use exactly these camelCase keys: company, stage, raiseUsd, risks. " +
+  "Do not invent alternate names (e.g. company_name, raise_amount_usd, risk_flags). " +
+  "Shape: " +
+  '{"company":string,"stage":"preSeed"|"seed"|"seriesA"|"seriesB"|"later",' +
+  '"raiseUsd":number,"risks":string[]}. ' +
+  "stage must be one of those five enum values exactly. " +
+  "Note: " +
+  '"Convexity is an AI-native ERP raising $1,000,000 at the seed stage. ' +
+  'Risks: revenue is unverified, and the CTO is still employed at Microsoft."';
 
 export const TaskSchema = z.object({
   company: z.string(),

@@ -4,6 +4,7 @@ import {
   MODELS,
   SURPLUS_URL,
   PROMPT,
+  SYSTEM,
   TaskSchema,
   SCHEMA_KEYS,
   REASONING_EFFORT,
@@ -73,6 +74,64 @@ function stripMarkdownFence(text: string): { fenced: boolean; body: string } {
   return { fenced: false, body: text };
 }
 
+/** First top-level `{...}` or `[...]` in text (handles trailing prose). */
+function extractJsonValue(text: string): string | null {
+  const start = text.search(/[\[{]/);
+  if (start < 0) return null;
+  const open = text[start];
+  const close = open === "{" ? "}" : "]";
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Repair raw model text so valid-but-messy JSON counts as a pass:
+ * markdown fences (```json ... ```), leading/trailing prose, etc.
+ * Returns null if we can't recover parseable JSON (SDK will fail as before).
+ */
+async function repairText({ text }: { text: string; error: unknown }): Promise<string | null> {
+  const raw = text.trim();
+  if (!raw) return null;
+
+  const candidates: string[] = [];
+  const { body: unfenced } = stripMarkdownFence(raw);
+  candidates.push(unfenced, raw);
+
+  const extracted = extractJsonValue(unfenced) ?? extractJsonValue(raw);
+  if (extracted) candidates.push(extracted);
+
+  for (const c of candidates) {
+    try {
+      JSON.parse(c);
+      // Prefer repaired text only when it differs from the raw (or is clean JSON).
+      if (c !== raw || /^\s*[\[{]/.test(c)) return c;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
 /**
  * Classify WHY structured output failed. Most "similar" failures across models
  * are the same root cause: the marketplace seller did NOT enforce json_schema,
@@ -124,19 +183,33 @@ function diagnose(e: unknown): {
     }
 
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const zod = TaskSchema.safeParse(parsed);
+      if (zod.success) {
+        // Repair path should have accepted this; if we land here, treat as fence noise only.
+        return {
+          ...usage,
+          failKind: "markdown_fence",
+          note: fenced
+            ? "valid schema object wrapped in markdown fence (should have been repaired)"
+            : "valid schema object but SDK parse failed",
+        };
+      }
       const got = Object.keys(parsed as object);
       const expected = [...SCHEMA_KEYS];
       const missing = expected.filter((k) => !(k in (parsed as object)));
       const extra = got.filter((k) => !expected.includes(k as (typeof SCHEMA_KEYS)[number]));
-      const parts = [
-        fenced ? "markdown-fenced JSON" : "JSON",
-        "but wrong shape",
-        `got {${got.join(", ") || "∅"}}`,
-        `need {${expected.join(", ")}}`,
-      ];
+      const parts: string[] = [];
+      if (fenced) parts.push("markdown-fenced");
+      parts.push("JSON failed schema");
+      parts.push(`got {${got.join(", ") || "∅"}}`);
+      parts.push(`need {${expected.join(", ")}}`);
       if (missing.length) parts.push(`missing: ${missing.join(", ")}`);
       if (extra.length) parts.push(`extra: ${extra.join(", ")}`);
-      parts.push("— seller ignored strict schema");
+      // Surface first Zod issue for enums/types (e.g. stage: "Seed" vs "seed").
+      const issue = zod.error.issues[0];
+      if (issue) {
+        parts.push(`${issue.path.join(".") || "root"}: ${issue.message}`);
+      }
       return {
         ...usage,
         failKind: "schema_mismatch",
@@ -220,12 +293,16 @@ async function attempt(model: string, key: string): Promise<Result> {
       const r = await generateObject({
         model: surplus(model),
         schema: TaskSchema,
+        system: SYSTEM,
         prompt: PROMPT,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         abortSignal: ctrl.signal,
         providerOptions: {
           surplus: { reasoning: { effort: REASONING_EFFORT }, include_reasoning: true },
         },
+        // Accept valid JSON that models wrap in ```json fences or a bit of prose.
+        // Still fails if the unwrapped object doesn't match TaskSchema.
+        experimental_repairText: repairText,
       });
 
       const usage: any = r.usage;
