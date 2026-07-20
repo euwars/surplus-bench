@@ -3,9 +3,9 @@ import { MODELS, REASONING_EFFORT } from "@/lib/models";
 import { saveRun, getLatest } from "@/lib/store";
 
 export const runtime = "nodejs";
-// Must exceed the per-model timeout (180s for long reports). Needs a Vercel
-// plan that allows it (Hobby caps at 60s → lower TIMEOUT_MS, or upgrade).
-export const maxDuration = 300;
+// Must exceed the per-model timeout (90s). Needs a Vercel plan that allows it
+// (Hobby caps at 60s → lower TIMEOUT_MS, or upgrade).
+export const maxDuration = 120;
 export const dynamic = "force-dynamic";
 
 // Streams NDJSON progress events so the UI can update model-by-model.

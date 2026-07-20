@@ -44,6 +44,45 @@ interface Data {
 }
 
 type LiveStatus = "queued" | "running" | "done";
+
+type SortKey =
+  | "model"
+  | "status"
+  | "think"
+  | "tokPerSec"
+  | "duration"
+  | "tokensOut"
+  | "cost"
+  | "reliability"
+  | "note";
+
+type SortDir = "asc" | "desc";
+
+const SORT_COLUMNS: { key: SortKey; label: string; align?: "left" | "right" }[] = [
+  { key: "model", label: "Model" },
+  { key: "status", label: "Status" },
+  { key: "think", label: "Think" },
+  { key: "tokPerSec", label: "Tok/s", align: "right" },
+  { key: "duration", label: "Duration", align: "right" },
+  { key: "tokensOut", label: "Out (reason)", align: "right" },
+  { key: "cost", label: "Cost", align: "right" },
+  { key: "reliability", label: "Reliability" },
+  { key: "note", label: "Note" },
+];
+
+/** Default: numbers/bools desc first; strings asc first. */
+const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = {
+  model: "asc",
+  status: "asc",
+  think: "desc",
+  tokPerSec: "desc",
+  duration: "asc",
+  tokensOut: "desc",
+  cost: "asc",
+  reliability: "desc",
+  note: "asc",
+};
+
 type LiveRow = {
   model: string;
   status: LiveStatus;
@@ -69,7 +108,20 @@ export default function Page() {
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [runError, setRunError] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<SortKey>("model");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
   const runningRef = useRef(false);
+
+  const toggleSort = useCallback((key: SortKey) => {
+    setSortKey((prev) => {
+      if (prev === key) {
+        setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+        return prev;
+      }
+      setSortDir(SORT_DEFAULT_DIR[key]);
+      return key;
+    });
+  }, []);
 
   const load = useCallback(async () => {
     const r = await fetch("/api/data", { cache: "no-store" });
@@ -252,6 +304,57 @@ export default function Page() {
     }));
   }, [live, data]);
 
+  const sortedRows: LiveRow[] = useMemo(() => {
+    const statusRank = (row: LiveRow) => {
+      if (row.status === "running") return 1;
+      if (row.status === "queued") return 2;
+      if (row.result?.ok) return 0; // pass first on asc
+      return 3; // fail
+    };
+
+    const valueOf = (row: LiveRow): string | number | null => {
+      const r = row.result ?? row.previous;
+      const rel = reliability[row.model];
+      switch (sortKey) {
+        case "model":
+          return row.model.toLowerCase();
+        case "status":
+          return statusRank(row);
+        case "think":
+          return r?.thinking ? 1 : 0;
+        case "tokPerSec":
+          return r?.tokPerSec ?? null;
+        case "duration":
+          return r?.duration ?? null;
+        case "tokensOut":
+          return r?.tokensOut ?? null;
+        case "cost":
+          return r?.costUSD ?? null;
+        case "reliability":
+          return rel && rel.total ? rel.ok / rel.total : null;
+        case "note":
+          return (row.status === "running" ? "in flight" : (row.result?.error ?? "")).toLowerCase();
+        default:
+          return null;
+      }
+    };
+
+    const dir = sortDir === "asc" ? 1 : -1;
+    return [...displayRows].sort((a, b) => {
+      const va = valueOf(a);
+      const vb = valueOf(b);
+      // Missing values always last, regardless of direction.
+      if (va == null && vb == null) return a.model.localeCompare(b.model);
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      let cmp = 0;
+      if (typeof va === "string" && typeof vb === "string") cmp = va.localeCompare(vb);
+      else cmp = (va as number) - (vb as number);
+      if (cmp !== 0) return cmp * dir;
+      return a.model.localeCompare(b.model);
+    });
+  }, [displayRows, sortKey, sortDir, reliability]);
+
   const models = displayRows.map((r) => r.model);
   const age = data?.latest ? Math.round((data.now - data.latest.at) / 1000) : null;
   const doneResults = displayRows.filter((r) => r.status === "done" && r.result);
@@ -403,19 +506,47 @@ export default function Page() {
               <table>
                 <thead>
                   <tr>
-                    <th>Model</th>
-                    <th>Status</th>
-                    <th>Think</th>
-                    <th>Tok/s</th>
-                    <th>Duration</th>
-                    <th>Out (reason)</th>
-                    <th>Cost</th>
-                    <th>Reliability</th>
-                    <th>Note</th>
+                    {SORT_COLUMNS.map((col) => {
+                      const active = sortKey === col.key;
+                      const ariaSort = active
+                        ? sortDir === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none";
+                      return (
+                        <th
+                          key={col.key}
+                          className={[
+                            "th-sort",
+                            active ? "th-sort-active" : "",
+                            col.align === "right" ? "th-num" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          aria-sort={ariaSort}
+                        >
+                          <button
+                            type="button"
+                            className="th-sort-btn"
+                            onClick={() => toggleSort(col.key)}
+                            title={
+                              active
+                                ? `Sorted ${sortDir === "asc" ? "ascending" : "descending"} — click to reverse`
+                                : `Sort by ${col.label}`
+                            }
+                          >
+                            <span>{col.label}</span>
+                            <span className="sort-ind" aria-hidden>
+                              {active ? (sortDir === "asc" ? "↑" : "↓") : "↕"}
+                            </span>
+                          </button>
+                        </th>
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody>
-                  {displayRows.map((row) => {
+                  {sortedRows.map((row) => {
                     const r = row.result ?? row.previous;
                     const isLive = row.status === "running";
                     const isStalePrev = isLive && !!row.previous;
@@ -943,10 +1074,60 @@ export default function Page() {
           color: var(--muted);
           font-weight: 500;
           font-size: 12px;
-          padding: 12px 14px;
+          padding: 0;
           border-bottom: 1px solid var(--border);
           white-space: nowrap;
           background: #fcfcfc;
+          user-select: none;
+        }
+
+        th.th-num .th-sort-btn {
+          justify-content: flex-end;
+        }
+
+        .th-sort-btn {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          width: 100%;
+          margin: 0;
+          padding: 12px 14px;
+          border: none;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-weight: 500;
+          font-size: 12px;
+          letter-spacing: inherit;
+          text-align: inherit;
+          cursor: pointer;
+          border-radius: 0;
+        }
+
+        .th-sort-btn:hover {
+          color: var(--fg);
+          background: #f4f4f5;
+        }
+
+        .th-sort-active .th-sort-btn {
+          color: var(--fg);
+          font-weight: 600;
+        }
+
+        .sort-ind {
+          font-size: 10px;
+          line-height: 1;
+          opacity: 0.35;
+          font-variant-numeric: tabular-nums;
+        }
+
+        .th-sort-active .sort-ind {
+          opacity: 0.85;
+          color: var(--run);
+        }
+
+        .th-sort-btn:hover .sort-ind {
+          opacity: 0.7;
         }
 
         td {

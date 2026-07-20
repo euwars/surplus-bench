@@ -22,9 +22,9 @@ export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 // 20k still leaves headroom for Pro-class thinking.
 export const MAX_OUTPUT_TOKENS = 20_000;
 
-// Parallel per-model wall clock. Longer generation needs more headroom.
+// Parallel per-model wall clock.
 // Route maxDuration must exceed this (Vercel Pro+ for multi-minute).
-export const TIMEOUT_MS = 180_000;
+export const TIMEOUT_MS = 90_000;
 
 import { jsonSchema, type Schema } from "ai";
 import { z } from "zod";
