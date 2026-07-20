@@ -19,8 +19,8 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
 // Content + thinking budget. Prompt length targets keep content ~2–4k tokens so
-// verbose models (e.g. Gemini Pro) finish JSON before this wall.
-export const MAX_OUTPUT_TOKENS = 8000;
+// most models finish well under this; 20k leaves headroom for Pro-class thinking.
+export const MAX_OUTPUT_TOKENS = 20_000;
 
 // Parallel per-model wall clock. Longer generation needs more headroom.
 // Route maxDuration must exceed this (Vercel Pro+ for multi-minute).
