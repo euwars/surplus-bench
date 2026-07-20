@@ -1,17 +1,13 @@
 // The models under test — edit this list to change what the harness benchmarks.
 export const MODELS = [
-  "glm-5.2",
   "kimi-k3",
   "gpt-5.4",
   "gpt-5.4-mini",
-  "gemini-3.1-pro-preview",
-  "gpt-5.6-sol-pro",
   "gpt-5.6-terra",
   "gpt-5.6-sol",
   "claude-opus-4.8",
   "claude-sonnet-5",
   "gpt-5.5",
-  "minimax-m3",
   "gemini-3-5-flash",
   "grok-4.5",
 ];
