@@ -6,6 +6,7 @@ import {
   PROMPT,
   SYSTEM,
   TaskSchema,
+  TaskProviderSchema,
   SCHEMA_KEYS,
   REASONING_EFFORT,
   MAX_OUTPUT_TOKENS,
@@ -414,9 +415,12 @@ async function attempt(model: string, key: string): Promise<Result> {
     try {
       // Non-streaming: one request/response. We only care about schema-valid
       // structured output + usage/latency, not token-by-token TTFT.
+      // TaskProviderSchema: provider-safe JSON Schema (minItems clamped to ≤1) +
+      // local validate() still uses full TaskSchema mins. SYSTEM/PROMPT requirements
+      // are generated from the same Zod source so they cannot drift.
       const r = await generateObject({
         model: surplus(model),
-        schema: TaskSchema,
+        schema: TaskProviderSchema,
         system: SYSTEM,
         prompt: PROMPT,
         maxOutputTokens: MAX_OUTPUT_TOKENS,

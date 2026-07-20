@@ -30,7 +30,9 @@ SURPLUS_API_KEY=inf_...
 Locally, put it in `.env.local` (gitignored). On Vercel, set it in Project
 Settings → Environment Variables.
 
-Edit the model list, prompt, and reasoning effort in `lib/models.ts`.
+Edit the model list, **TaskSchema** (Zod — source of truth for shape + mins),
+and reasoning effort in `lib/models.ts`. `SYSTEM` / `PROMPT` requirements and the
+provider JSON schema are generated from that schema so they cannot drift.
 
 ## Run locally
 
