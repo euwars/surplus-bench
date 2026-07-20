@@ -4,7 +4,7 @@ import {
   MODELS,
   SURPLUS_URL,
   PROMPT,
-  FindingsSchema,
+  TaskSchema,
   REASONING_EFFORT,
   MAX_OUTPUT_TOKENS,
   TIMEOUT_MS,
@@ -128,7 +128,7 @@ async function attempt(model: string, key: string): Promise<Result> {
     try {
       const r = streamObject({
         model: surplus(model),
-        schema: FindingsSchema,
+        schema: TaskSchema,
         prompt: PROMPT,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         abortSignal: ctrl.signal,

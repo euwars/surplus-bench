@@ -18,8 +18,10 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 // still apples-to-apples, much less thinking-token burn before JSON.
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
-// Lean output budget: findings JSON is small; low effort needs less headroom.
-export const MAX_OUTPUT_TOKENS = 1600;
+// Generous output budget so a reasoning model never truncates before the JSON
+// — that would be a false "could not parse". The findings payload is tiny; the
+// headroom is for thinking tokens. You only pay for tokens actually used.
+export const MAX_OUTPUT_TOKENS = 8000;
 
 // Parallel per-model wall clock — dominates total run time. Two minutes so
 // slow-but-capable models (kimi-k3, opus-4.8, gpt-5.6-sol-pro) get a real
@@ -28,30 +30,23 @@ export const MAX_OUTPUT_TOKENS = 1600;
 // above Hobby (Hobby caps functions at 60s → drop this to ~55s there).
 export const TIMEOUT_MS = 120_000;
 
-// One prompt, identical for every model, that demands real structured output.
-export const PROMPT =
-  "You are a diligence analyst. Company: Convexity, an AI-native ERP for " +
-  "inventory-heavy mid-market distributors. It layers AI agents onto existing " +
-  "ERPs (SAP, NetSuite) to automate purchasing. Founder claims ~$130K ARR " +
-  "across 9 customers, a verified GreeneStep partnership, and unverified " +
-  "BlueLink/Cubbo partnerships. No corporate registration was found publicly. " +
-  "Produce up to 5 diligence findings. Each finding: a claim, a status " +
-  "(established | claimedOnly | contradicted | notFound), one line of evidence, " +
-  "and a source.";
-
 import { z } from "zod";
 
-// The structured-output contract. Reliability = did streamObject produce a
-// conformant object (exact fields, valid enum, non-empty findings).
-export const FindingsSchema = z.object({
-  findings: z
-    .array(
-      z.object({
-        claim: z.string(),
-        status: z.enum(["established", "claimedOnly", "contradicted", "notFound"]),
-        evidence: z.string(),
-        source: z.string(),
-      })
-    )
-    .min(1),
+// A lean, near-deterministic extraction: the answer is embedded in the note, so
+// every model should produce the SAME small object. That makes the benchmark
+// about structured-output RELIABILITY and speed — not generation — with low
+// token variance across models and runs. The schema still exercises the pieces
+// weak sellers mishandle: an enum, a number, and an array.
+export const PROMPT =
+  'Extract structured data from this note. ' +
+  'Note: "Convexity is an AI-native ERP raising $1,000,000 at the seed stage. ' +
+  'Risks: revenue is unverified, and the CTO is still employed at Microsoft." ' +
+  "Return the company name, its stage, the raise amount in USD as a number, " +
+  "and the list of risk flags.";
+
+export const TaskSchema = z.object({
+  company: z.string(),
+  stage: z.enum(["preSeed", "seed", "seriesA", "seriesB", "later"]),
+  raiseUsd: z.number(),
+  risks: z.array(z.string()).min(1),
 });
