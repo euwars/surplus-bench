@@ -14,11 +14,19 @@ export const MODELS = [
 
 export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 
-// Requested for EVERY model so the comparison is apples-to-apples. Models that
-// can't reason ignore it (recorded as no-thinking); reasoning models are held
-// to the same effort. include_reasoning asks the seller to stream the thinking
-// so we can measure whether it's visible.
-export const REASONING_EFFORT: "low" | "medium" | "high" = "medium";
+// Same effort for every model. "low" is the fast path for frequent updates —
+// still apples-to-apples, much less thinking-token burn before JSON.
+export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
+
+// Lean output budget: findings JSON is small; low effort needs less headroom.
+export const MAX_OUTPUT_TOKENS = 1600;
+
+// Parallel per-model wall clock — dominates total run time. Two minutes so
+// slow-but-capable models (kimi-k3, opus-4.8, gpt-5.6-sol-pro) get a real
+// chance instead of a false timeout. NOTE: the run's function must be allowed
+// to live this long — route maxDuration is 300s, which needs a Vercel plan
+// above Hobby (Hobby caps functions at 60s → drop this to ~55s there).
+export const TIMEOUT_MS = 120_000;
 
 // One prompt, identical for every model, that demands real structured output.
 export const PROMPT =
@@ -33,8 +41,7 @@ export const PROMPT =
 
 import { z } from "zod";
 
-// The structured-output contract. The AI SDK validates the model's output
-// against this — reliability = did generateObject/streamObject produce a
+// The structured-output contract. Reliability = did streamObject produce a
 // conformant object (exact fields, valid enum, non-empty findings).
 export const FindingsSchema = z.object({
   findings: z

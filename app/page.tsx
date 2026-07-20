@@ -1,11 +1,13 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MODELS, REASONING_EFFORT } from "@/lib/models";
 
 interface Result {
   model: string;
   ok: boolean;
   jsonValid: boolean;
   error: string | null;
+  finishReason?: string | null;
   ttft: number | null;
   duration: number;
   tokensIn: number;
@@ -17,42 +19,194 @@ interface Result {
   tokPerSec: number | null;
   costUSD: number;
 }
-interface Run { at: number; results: Result[]; }
-interface Data { latest: Run | null; history: Run[]; persistent: boolean; now: number; }
+interface Run {
+  at: number;
+  results: Result[];
+}
+interface Data {
+  latest: Run | null;
+  history: Run[];
+  persistent: boolean;
+  now: number;
+}
+
+type LiveStatus = "queued" | "running" | "done";
+type LiveRow = {
+  model: string;
+  status: LiveStatus;
+  result: Result | null;
+  /** previous result shown while this model is still running */
+  previous: Result | null;
+};
+
+type ProgressEvent =
+  | { type: "start"; models: string[]; at: number; reasoningEffort: string }
+  | { type: "result"; result: Result; done: number; total: number }
+  | { type: "done"; run: Run }
+  | { type: "skipped"; run: Run }
+  | { type: "error"; error: string };
 
 const STALE_MS = 10 * 60 * 1000;
 
 export default function Page() {
   const [data, setData] = useState<Data | null>(null);
   const [running, setRunning] = useState(false);
+  const [live, setLive] = useState<LiveRow[] | null>(null);
+  const [progress, setProgress] = useState({ done: 0, total: MODELS.length });
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [runError, setRunError] = useState<string | null>(null);
+  const runningRef = useRef(false);
 
-  async function load() {
+  const load = useCallback(async () => {
     const r = await fetch("/api/data", { cache: "no-store" });
     setData(await r.json());
-  }
-  async function trigger() {
-    if (running) return;
+  }, []);
+
+  const trigger = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
     setRunning(true);
-    try { await fetch("/api/run", { cache: "no-store" }); } finally { setRunning(false); load(); }
-  }
+    setRunError(null);
+    setRunStartedAt(Date.now());
+    setElapsed(0);
+    setProgress({ done: 0, total: MODELS.length });
 
-  useEffect(() => { load(); }, []);
-  // On first load with no/stale data, kick a run immediately.
+    // Seed live rows from previous results (if any) so the table stays useful.
+    const prevByModel = new Map(
+      (data?.latest?.results ?? []).map((r) => [r.model, r] as const),
+    );
+    setLive(
+      MODELS.map((model) => ({
+        model,
+        status: "running" as const,
+        result: null,
+        previous: prevByModel.get(model) ?? null,
+      })),
+    );
+
+    try {
+      const res = await fetch("/api/run", { cache: "no-store" });
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => "");
+        throw new Error(text || `Run failed (${res.status})`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let event: ProgressEvent;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          handleEvent(event);
+        }
+      }
+      if (buf.trim()) {
+        try {
+          handleEvent(JSON.parse(buf) as ProgressEvent);
+        } catch {
+          /* ignore trailing partial */
+        }
+      }
+    } catch (e: any) {
+      setRunError(String(e?.message ?? e).slice(0, 200));
+    } finally {
+      runningRef.current = false;
+      setRunning(false);
+      setRunStartedAt(null);
+      await load();
+      // Clear live overlay after data refresh so we show stored latest cleanly.
+      setLive(null);
+    }
+
+    function handleEvent(event: ProgressEvent) {
+      if (event.type === "start") {
+        setProgress({ done: 0, total: event.models.length });
+        setLive(
+          event.models.map((model) => ({
+            model,
+            status: "running" as const,
+            result: null,
+            previous: prevByModel.get(model) ?? null,
+          })),
+        );
+      } else if (event.type === "result") {
+        setProgress({ done: event.done, total: event.total });
+        setLive((rows) =>
+          (rows ?? []).map((row) =>
+            row.model === event.result.model
+              ? { ...row, status: "done", result: event.result }
+              : row,
+          ),
+        );
+      } else if (event.type === "done") {
+        setProgress({ done: event.run.results.length, total: event.run.results.length });
+        setLive(
+          event.run.results.map((result) => ({
+            model: result.model,
+            status: "done" as const,
+            result,
+            previous: null,
+          })),
+        );
+      } else if (event.type === "skipped") {
+        setProgress({
+          done: event.run.results.length,
+          total: event.run.results.length,
+        });
+        setLive(
+          event.run.results.map((result) => ({
+            model: result.model,
+            status: "done" as const,
+            result,
+            previous: null,
+          })),
+        );
+      } else if (event.type === "error") {
+        setRunError(event.error);
+      }
+    }
+  }, [data, load]);
+
   useEffect(() => {
-    if (!data) return;
+    load();
+  }, [load]);
+
+  // Auto-run when missing/stale.
+  useEffect(() => {
+    if (!data || runningRef.current) return;
     const age = data.latest ? data.now - data.latest.at : Infinity;
-    if (age > STALE_MS && !running) trigger();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data]);
-  // Poll for fresh data every 20s.
-  useEffect(() => { const t = setInterval(load, 20_000); return () => clearInterval(t); }, []);
+    if (age > STALE_MS) trigger();
+  }, [data, trigger]);
 
-  const models = useMemo(() => {
-    if (!data?.latest) return [];
-    return data.latest.results.map((r) => r.model);
-  }, [data]);
+  // Tick elapsed while running.
+  useEffect(() => {
+    if (!running || runStartedAt === null) return;
+    const tick = () => setElapsed(Math.round((Date.now() - runStartedAt) / 100) / 10);
+    tick();
+    const id = setInterval(tick, 100);
+    return () => clearInterval(id);
+  }, [running, runStartedAt]);
 
-  // Per-model reliability over history (fraction of runs where JSON was valid).
+  // Background poll only when idle (live stream owns the active run).
+  useEffect(() => {
+    if (running) return;
+    const t = setInterval(load, 20_000);
+    return () => clearInterval(t);
+  }, [running, load]);
+
   const reliability = useMemo(() => {
     if (!data) return {};
     const out: Record<string, { total: number; ok: number }> = {};
@@ -66,136 +220,976 @@ export default function Page() {
     return out;
   }, [data]);
 
+  // Prefer live rows while a run is active; otherwise stored latest.
+  const displayRows: LiveRow[] = useMemo(() => {
+    if (live) return live;
+    if (data?.latest) {
+      return data.latest.results.map((result) => ({
+        model: result.model,
+        status: "done" as const,
+        result,
+        previous: null,
+      }));
+    }
+    return MODELS.map((model) => ({
+      model,
+      status: "queued" as const,
+      result: null,
+      previous: null,
+    }));
+  }, [live, data]);
+
+  const models = displayRows.map((r) => r.model);
   const age = data?.latest ? Math.round((data.now - data.latest.at) / 1000) : null;
+  const doneResults = displayRows.filter((r) => r.status === "done" && r.result);
+  const livePass = doneResults.filter((r) => r.result!.ok).length;
+  const liveFail = doneResults.filter((r) => r.result && !r.result.ok).length;
+  const stillGoing = displayRows.filter((r) => r.status === "running").length;
+  const pctDone =
+    progress.total > 0 ? Math.round((100 * progress.done) / progress.total) : 0;
+  const effort =
+    displayRows.find((r) => r.result)?.result?.reasoningEffort ?? REASONING_EFFORT;
 
   return (
-    <main>
-      <header>
-        <h1>Surplus model benchmark</h1>
-        <div className="status">
-          {data ? (
-            <>
-              <span className={running ? "dot live" : "dot"} />
-              {running ? "running…" : age === null ? "no data yet" : `updated ${fmtAge(age)} ago`}
-              {" · "}{data.history.length} runs
-              {data.latest?.results[0]?.reasoningEffort ? ` · reasoning: ${data.latest.results[0].reasoningEffort} (same for all)` : ""}
-              {" · "}{data.persistent ? "persistent" : "in-memory (add Vercel KV for history)"}
-              <button onClick={trigger} disabled={running}>Run now</button>
-            </>
-          ) : "loading…"}
-        </div>
-      </header>
-
-      {!data?.latest && !running && (
-        <p className="empty">No runs yet — a benchmark starts automatically. This first pass takes up to a minute.</p>
-      )}
-
-      {data?.latest && (
-        <table>
-          <thead>
-            <tr>
-              <th>Model</th><th>JSON</th><th>think</th><th>first tok</th><th>tok/s</th>
-              <th>duration</th><th>out (reason)</th><th>cost</th><th>reliability</th><th>note</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.latest.results.map((r) => {
-              const rel = reliability[r.model];
-              const pct = rel && rel.total ? Math.round((100 * rel.ok) / rel.total) : null;
-              return (
-                <tr key={r.model} className={r.ok ? "" : "fail"}>
-                  <td className="model">{r.model}</td>
-                  <td>{r.ok ? <span className="ok">✓</span> : <span className="x">✗</span>}</td>
-                  <td className="think">
-                    {r.thinking
-                      ? (r.thinkingVisible ? <span title="reasons, thinking visible">🧠 seen</span>
-                                           : <span title="reasons, thinking hidden">🧠 hidden</span>)
-                      : <span className="none" title="no reasoning">—</span>}
-                  </td>
-                  <td>{r.ttft !== null ? `${r.ttft.toFixed(1)}s` : "—"}</td>
-                  <td>{r.tokPerSec ?? "—"}</td>
-                  <td>{r.duration.toFixed(1)}s</td>
-                  <td>{r.tokensOut}{r.reasoningTokens ? ` (${r.reasoningTokens})` : ""}</td>
-                  <td>{r.costUSD ? `$${r.costUSD.toFixed(4)}` : "—"}</td>
-                  <td>
-                    {pct !== null ? (
-                      <span className="rel">
-                        <span className="bar"><span style={{ width: `${pct}%` }} className={pct >= 90 ? "g" : pct >= 60 ? "y" : "r"} /></span>
-                        {pct}%
-                      </span>
-                    ) : "—"}
-                  </td>
-                  <td className="note">{r.error ?? ""}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
-
-      {data && data.history.length > 1 && (
-        <section className="charts">
-          <h2>JSON reliability over time</h2>
-          <div className="grid">
-            {models.map((m) => (
-              <Spark key={m} model={m} history={data.history} />
-            ))}
+    <main className="page">
+      <div className="shell">
+        <header className="hero">
+          <div className="hero-text">
+            <p className="eyebrow">Surplus · structured output</p>
+            <h1>Model benchmark</h1>
+            <p className="lede">
+              Reliability, latency, reasoning, and cost — same prompt and schema for every model.
+            </p>
           </div>
-        </section>
-      )}
+          <button className="btn-primary" onClick={() => trigger()} disabled={running || !data}>
+            {running ? (
+              <>
+                <span className="spinner" />
+                {progress.done}/{progress.total}
+              </>
+            ) : (
+              "Run now"
+            )}
+          </button>
+        </header>
+
+        <div className="meta">
+          {!data ? (
+            <span className="muted">Loading…</span>
+          ) : (
+            <>
+              <span className={`pill ${running ? "pill-live" : "pill-idle"}`}>
+                <span className={`dot ${running ? "live" : ""}`} />
+                {running
+                  ? `Running · ${elapsed.toFixed(1)}s`
+                  : age === null
+                    ? "No data"
+                    : `Updated ${fmtAge(age)} ago`}
+              </span>
+              {running ? (
+                <>
+                  <span className="pill">
+                    <strong>
+                      {progress.done}/{progress.total}
+                    </strong>{" "}
+                    done
+                  </span>
+                  <span className="pill pill-ok">
+                    <strong>{livePass}</strong> pass
+                  </span>
+                  <span className="pill pill-fail">
+                    <strong>{liveFail}</strong> fail
+                  </span>
+                  {stillGoing > 0 && (
+                    <span className="pill muted-pill">{stillGoing} in flight</span>
+                  )}
+                </>
+              ) : (
+                doneResults.length > 0 && (
+                  <span className="pill">
+                    <strong>
+                      {livePass}/{doneResults.length}
+                    </strong>{" "}
+                    passed
+                  </span>
+                )
+              )}
+              <span className="pill">{data.history.length} runs</span>
+              <span className="pill">Reasoning · {effort}</span>
+              <span className="pill muted-pill">
+                {data.persistent ? "Persistent store" : "In-memory history"}
+              </span>
+            </>
+          )}
+        </div>
+
+        {running && (
+          <div className="progress-card card">
+            <div className="progress-top">
+              <div>
+                <strong>
+                  {progress.done} of {progress.total} models finished
+                </strong>
+                <span className="muted">
+                  {" "}
+                  · {stillGoing} still running · {elapsed.toFixed(1)}s elapsed
+                </span>
+              </div>
+              <span className="progress-pct">{pctDone}%</span>
+            </div>
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: `${pctDone}%` }} />
+            </div>
+            <div className="chip-row">
+              {displayRows.map((row) => (
+                <span
+                  key={row.model}
+                  className={`chip chip-${row.status} ${
+                    row.result ? (row.result.ok ? "chip-pass" : "chip-fail") : ""
+                  }`}
+                  title={
+                    row.result
+                      ? `${row.model}: ${row.result.ok ? "pass" : "fail"} · ${row.result.duration}s`
+                      : `${row.model}: running…`
+                  }
+                >
+                  <span className="chip-dot" />
+                  {row.model}
+                  {row.result ? (
+                    <span className="chip-meta">{row.result.duration.toFixed(1)}s</span>
+                  ) : (
+                    <span className="chip-meta">…</span>
+                  )}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {runError && (
+          <div className="error-banner card">
+            <strong>Run error</strong>
+            <span>{runError}</span>
+          </div>
+        )}
+
+        {!data?.latest && !running && (
+          <div className="empty card">
+            <div className="empty-icon">○</div>
+            <h2>No runs yet</h2>
+            <p>A benchmark starts automatically when data is missing or stale.</p>
+          </div>
+        )}
+
+        {(data?.latest || running) && (
+          <section className="card table-card">
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>Status</th>
+                    <th>Think</th>
+                    <th>First tok</th>
+                    <th>Tok/s</th>
+                    <th>Duration</th>
+                    <th>Out (reason)</th>
+                    <th>Cost</th>
+                    <th>Reliability</th>
+                    <th>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {displayRows.map((row) => {
+                    const r = row.result ?? row.previous;
+                    const isLive = row.status === "running";
+                    const isStalePrev = isLive && !!row.previous;
+                    const rel = reliability[row.model];
+                    const relPct =
+                      rel && rel.total ? Math.round((100 * rel.ok) / rel.total) : null;
+
+                    return (
+                      <tr
+                        key={row.model}
+                        className={[
+                          row.result && !row.result.ok ? "fail" : "",
+                          isLive ? "running-row" : "",
+                          isStalePrev ? "stale-prev" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                      >
+                        <td className="model">{row.model}</td>
+                        <td>
+                          {isLive ? (
+                            <span className="badge badge-run">
+                              <span className="mini-spin" />
+                              Running
+                            </span>
+                          ) : row.result ? (
+                            row.result.ok ? (
+                              <span className="badge badge-ok">Pass</span>
+                            ) : (
+                              <span className="badge badge-fail">Fail</span>
+                            )
+                          ) : (
+                            <span className="badge badge-think">Queued</span>
+                          )}
+                        </td>
+                        <td>
+                          {isLive && !r ? (
+                            <span className="dash">—</span>
+                          ) : r?.thinking ? (
+                            <span
+                              className="badge badge-think"
+                              title={
+                                r.thinkingVisible
+                                  ? "Reasons, thinking visible"
+                                  : "Reasons, thinking hidden"
+                              }
+                            >
+                              {r.thinkingVisible ? "Seen" : "Hidden"}
+                            </span>
+                          ) : (
+                            <span className="dash">—</span>
+                          )}
+                        </td>
+                        <td className="num">
+                          {r && !isLive
+                            ? r.ttft !== null
+                              ? `${r.ttft.toFixed(1)}s`
+                              : "—"
+                            : isStalePrev && r?.ttft != null
+                              ? `${r.ttft.toFixed(1)}s`
+                              : "—"}
+                        </td>
+                        <td className="num">
+                          {!isLive && r ? (r.tokPerSec ?? "—") : isStalePrev ? (r?.tokPerSec ?? "—") : "—"}
+                        </td>
+                        <td className="num">
+                          {!isLive && r
+                            ? `${r.duration.toFixed(1)}s`
+                            : isLive
+                              ? "…"
+                              : "—"}
+                        </td>
+                        <td className="num">
+                          {!isLive && r ? (
+                            <>
+                              {r.tokensOut}
+                              {r.reasoningTokens ? (
+                                <span className="sub"> ({r.reasoningTokens})</span>
+                              ) : null}
+                            </>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="num">
+                          {!isLive && r
+                            ? r.costUSD
+                              ? `$${r.costUSD.toFixed(4)}`
+                              : "—"
+                            : "—"}
+                        </td>
+                        <td>
+                          {relPct !== null ? (
+                            <span className="rel">
+                              <span className="bar">
+                                <span
+                                  style={{ width: `${relPct}%` }}
+                                  className={relPct >= 90 ? "g" : relPct >= 60 ? "y" : "r"}
+                                />
+                              </span>
+                              <span className="pct">{relPct}%</span>
+                            </span>
+                          ) : (
+                            <span className="dash">—</span>
+                          )}
+                        </td>
+                        <td
+                          className="note"
+                          title={
+                            isLive
+                              ? "In flight…"
+                              : (row.result?.error ?? undefined)
+                          }
+                        >
+                          {isLive ? "In flight…" : (row.result?.error ?? "")}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {data && data.history.length > 1 && (
+          <section className="charts">
+            <div className="section-head">
+              <h2>JSON reliability over time</h2>
+              <p className="muted">Oldest → newest. Green pass, red fail.</p>
+            </div>
+            <div className="grid">
+              {models.map((m) => (
+                <Spark key={m} model={m} history={data.history} />
+              ))}
+            </div>
+          </section>
+        )}
+      </div>
 
       <style jsx global>{`
-        * { box-sizing: border-box; }
-        body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-          background: #0b0d10; color: #d8dee9; }
-        main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 60px; }
-        h1 { font-size: 18px; margin: 0 0 4px; }
-        h2 { font-size: 13px; color: #8a94a6; margin: 28px 0 10px; text-transform: uppercase; letter-spacing: .05em; }
-        header { border-bottom: 1px solid #1c2128; padding-bottom: 12px; margin-bottom: 16px; }
-        .status { color: #8a94a6; font-size: 13px; display: flex; align-items: center; gap: 8px; }
-        .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a4151; display: inline-block; }
-        .dot.live { background: #4ade80; animation: pulse 1s infinite; }
-        @keyframes pulse { 50% { opacity: .3; } }
-        button { margin-left: auto; background: #1c2430; color: #d8dee9; border: 1px solid #2b3444;
-          padding: 4px 12px; border-radius: 6px; cursor: pointer; font: inherit; font-size: 12px; }
-        button:disabled { opacity: .5; cursor: default; }
-        .empty { color: #8a94a6; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th { text-align: left; color: #6b7280; font-weight: 500; padding: 6px 10px; border-bottom: 1px solid #1c2128; }
-        td { padding: 7px 10px; border-bottom: 1px solid #14181e; }
-        tr.fail td.model { color: #f87171; }
-        .model { font-weight: 600; }
-        .ok { color: #4ade80; } .x { color: #f87171; }
-        .note { color: #6b7280; font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .rel { display: flex; align-items: center; gap: 6px; }
-        .bar { width: 54px; height: 6px; background: #1c2128; border-radius: 3px; overflow: hidden; display: inline-block; }
-        .bar span { display: block; height: 100%; }
-        .bar .g { background: #4ade80; } .bar .y { background: #fbbf24; } .bar .r { background: #f87171; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-        .spark { border: 1px solid #1c2128; border-radius: 8px; padding: 10px; }
-        .spark .name { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+        :root {
+          --bg: #fafafa;
+          --card: #ffffff;
+          --fg: #09090b;
+          --muted: #71717a;
+          --border: #e4e4e7;
+          --border-strong: #d4d4d8;
+          --ring: #18181b;
+          --ok: #16a34a;
+          --ok-bg: #f0fdf4;
+          --ok-border: #bbf7d0;
+          --fail: #dc2626;
+          --fail-bg: #fef2f2;
+          --fail-border: #fecaca;
+          --run: #2563eb;
+          --run-bg: #eff6ff;
+          --run-border: #bfdbfe;
+          --think-bg: #f4f4f5;
+          --think-fg: #3f3f46;
+          --warn: #ca8a04;
+          --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.03);
+          --radius: 12px;
+          --radius-sm: 8px;
+          --radius-pill: 999px;
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        html,
+        body {
+          margin: 0;
+          min-height: 100%;
+        }
+
+        body {
+          font-family:
+            Inter,
+            ui-sans-serif,
+            system-ui,
+            -apple-system,
+            Segoe UI,
+            Roboto,
+            Helvetica,
+            Arial,
+            sans-serif;
+          font-size: 14px;
+          line-height: 1.5;
+          background: var(--bg);
+          color: var(--fg);
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+        }
+
+        .page {
+          min-height: 100vh;
+          padding: 40px 20px 72px;
+        }
+
+        .shell {
+          max-width: 1120px;
+          margin: 0 auto;
+        }
+
+        .hero {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 24px;
+          margin-bottom: 20px;
+        }
+
+        .eyebrow {
+          margin: 0 0 6px;
+          font-size: 12px;
+          font-weight: 500;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+
+        h1 {
+          margin: 0;
+          font-size: 28px;
+          font-weight: 600;
+          letter-spacing: -0.03em;
+          line-height: 1.2;
+        }
+
+        .lede {
+          margin: 8px 0 0;
+          max-width: 42rem;
+          color: var(--muted);
+          font-size: 14px;
+        }
+
+        .btn-primary {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          flex-shrink: 0;
+          min-width: 110px;
+          height: 36px;
+          padding: 0 16px;
+          border: 1px solid var(--ring);
+          border-radius: var(--radius-sm);
+          background: var(--fg);
+          color: #fff;
+          font: inherit;
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+          box-shadow: var(--shadow);
+          transition:
+            background 0.15s ease,
+            opacity 0.15s ease;
+          font-variant-numeric: tabular-nums;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+          background: #27272a;
+        }
+
+        .btn-primary:disabled {
+          opacity: 0.55;
+          cursor: default;
+        }
+
+        .spinner,
+        .mini-spin {
+          width: 12px;
+          height: 12px;
+          border: 2px solid rgba(255, 255, 255, 0.35);
+          border-top-color: #fff;
+          border-radius: 50%;
+          animation: spin 0.7s linear infinite;
+        }
+
+        .mini-spin {
+          width: 10px;
+          height: 10px;
+          border-color: rgba(37, 99, 235, 0.25);
+          border-top-color: var(--run);
+        }
+
+        @keyframes spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+
+        .meta {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 16px;
+        }
+
+        .pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          height: 28px;
+          padding: 0 10px;
+          border: 1px solid var(--border);
+          border-radius: var(--radius-pill);
+          background: var(--card);
+          color: var(--fg);
+          font-size: 12px;
+          font-weight: 500;
+          box-shadow: var(--shadow);
+          font-variant-numeric: tabular-nums;
+        }
+
+        .pill strong {
+          font-weight: 600;
+        }
+
+        .muted-pill {
+          color: var(--muted);
+          font-weight: 400;
+        }
+
+        .pill-live {
+          border-color: var(--run-border);
+          background: var(--run-bg);
+          color: var(--run);
+        }
+
+        .pill-ok {
+          border-color: var(--ok-border);
+          background: var(--ok-bg);
+          color: var(--ok);
+        }
+
+        .pill-fail {
+          border-color: var(--fail-border);
+          background: var(--fail-bg);
+          color: var(--fail);
+        }
+
+        .pill-idle {
+          color: var(--muted);
+        }
+
+        .dot {
+          width: 7px;
+          height: 7px;
+          border-radius: 50%;
+          background: #d4d4d8;
+          display: inline-block;
+        }
+
+        .dot.live {
+          background: var(--run);
+          animation: pulse 1.2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+          50% {
+            opacity: 0.35;
+          }
+        }
+
+        .muted {
+          color: var(--muted);
+        }
+
+        .card {
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          box-shadow: var(--shadow);
+        }
+
+        .progress-card {
+          padding: 14px 16px 12px;
+          margin-bottom: 16px;
+        }
+
+        .progress-top {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 10px;
+          font-size: 13px;
+        }
+
+        .progress-pct {
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          color: var(--fg);
+        }
+
+        .progress-track {
+          height: 8px;
+          background: #f4f4f5;
+          border: 1px solid var(--border);
+          border-radius: var(--radius-pill);
+          overflow: hidden;
+          margin-bottom: 12px;
+        }
+
+        .progress-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #3b82f6, #2563eb);
+          border-radius: var(--radius-pill);
+          transition: width 0.25s ease;
+        }
+
+        .chip-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          height: 26px;
+          padding: 0 9px;
+          border-radius: var(--radius-pill);
+          border: 1px solid var(--border);
+          background: #fafafa;
+          font-size: 11px;
+          font-weight: 500;
+          color: var(--muted);
+          font-variant-numeric: tabular-nums;
+        }
+
+        .chip-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #d4d4d8;
+        }
+
+        .chip-running .chip-dot {
+          background: var(--run);
+          animation: pulse 1s ease-in-out infinite;
+        }
+
+        .chip-running {
+          border-color: var(--run-border);
+          background: var(--run-bg);
+          color: var(--run);
+        }
+
+        .chip-done.chip-pass {
+          border-color: var(--ok-border);
+          background: var(--ok-bg);
+          color: var(--ok);
+        }
+
+        .chip-done.chip-pass .chip-dot {
+          background: var(--ok);
+        }
+
+        .chip-done.chip-fail {
+          border-color: var(--fail-border);
+          background: var(--fail-bg);
+          color: var(--fail);
+        }
+
+        .chip-done.chip-fail .chip-dot {
+          background: var(--fail);
+        }
+
+        .chip-meta {
+          opacity: 0.75;
+          font-weight: 400;
+        }
+
+        .error-banner {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          padding: 12px 14px;
+          margin-bottom: 16px;
+          border-color: var(--fail-border);
+          background: var(--fail-bg);
+          color: var(--fail);
+          font-size: 13px;
+        }
+
+        .empty {
+          padding: 48px 28px;
+          text-align: center;
+        }
+
+        .empty-icon {
+          font-size: 28px;
+          color: var(--muted);
+          margin-bottom: 12px;
+          line-height: 1;
+        }
+
+        .empty h2 {
+          margin: 0 0 6px;
+          font-size: 16px;
+          font-weight: 600;
+          letter-spacing: -0.01em;
+        }
+
+        .empty p {
+          margin: 0 auto;
+          max-width: 28rem;
+          color: var(--muted);
+          font-size: 13px;
+        }
+
+        .table-card {
+          overflow: hidden;
+        }
+
+        .table-wrap {
+          overflow-x: auto;
+        }
+
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 13px;
+        }
+
+        th {
+          text-align: left;
+          color: var(--muted);
+          font-weight: 500;
+          font-size: 12px;
+          padding: 12px 14px;
+          border-bottom: 1px solid var(--border);
+          white-space: nowrap;
+          background: #fcfcfc;
+        }
+
+        td {
+          padding: 12px 14px;
+          border-bottom: 1px solid var(--border);
+          vertical-align: middle;
+        }
+
+        tbody tr:last-child td {
+          border-bottom: none;
+        }
+
+        tbody tr:hover td {
+          background: #fafafa;
+        }
+
+        tr.fail td {
+          background: #fffbfb;
+        }
+
+        tr.fail:hover td {
+          background: #fef6f6;
+        }
+
+        tr.running-row td {
+          background: #f8fafc;
+        }
+
+        tr.running-row:hover td {
+          background: #f1f5f9;
+        }
+
+        tr.stale-prev td.num,
+        tr.stale-prev td.note {
+          opacity: 0.45;
+        }
+
+        .model {
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          letter-spacing: -0.01em;
+          white-space: nowrap;
+        }
+
+        tr.fail .model {
+          color: var(--fail);
+        }
+
+        .num {
+          font-variant-numeric: tabular-nums;
+          color: #3f3f46;
+          white-space: nowrap;
+        }
+
+        .sub {
+          color: var(--muted);
+        }
+
+        .dash {
+          color: #a1a1aa;
+        }
+
+        .badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          height: 22px;
+          padding: 0 8px;
+          border-radius: var(--radius-pill);
+          font-size: 11px;
+          font-weight: 600;
+          letter-spacing: 0.01em;
+          border: 1px solid transparent;
+          white-space: nowrap;
+        }
+
+        .badge-ok {
+          color: var(--ok);
+          background: var(--ok-bg);
+          border-color: var(--ok-border);
+        }
+
+        .badge-fail {
+          color: var(--fail);
+          background: var(--fail-bg);
+          border-color: var(--fail-border);
+        }
+
+        .badge-run {
+          color: var(--run);
+          background: var(--run-bg);
+          border-color: var(--run-border);
+        }
+
+        .badge-think {
+          color: var(--think-fg);
+          background: var(--think-bg);
+          border-color: var(--border);
+        }
+
+        .note {
+          color: var(--muted);
+          font-size: 12px;
+          max-width: 200px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .rel {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .bar {
+          width: 56px;
+          height: 6px;
+          background: #f4f4f5;
+          border: 1px solid var(--border);
+          border-radius: 3px;
+          overflow: hidden;
+          display: inline-block;
+        }
+
+        .bar span {
+          display: block;
+          height: 100%;
+          border-radius: 2px;
+        }
+
+        .bar .g {
+          background: var(--ok);
+        }
+        .bar .y {
+          background: var(--warn);
+        }
+        .bar .r {
+          background: var(--fail);
+        }
+
+        .pct {
+          font-variant-numeric: tabular-nums;
+          font-size: 12px;
+          color: #3f3f46;
+          min-width: 2.5em;
+        }
+
+        .charts {
+          margin-top: 28px;
+        }
+
+        .section-head {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+        }
+
+        .section-head h2 {
+          margin: 0;
+          font-size: 14px;
+          font-weight: 600;
+          letter-spacing: -0.01em;
+        }
+
+        .section-head .muted {
+          font-size: 12px;
+        }
+
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+          gap: 12px;
+        }
+
+        .spark {
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          padding: 14px;
+          box-shadow: var(--shadow);
+        }
+
+        .spark .name {
+          font-size: 12px;
+          font-weight: 600;
+          margin-bottom: 10px;
+          letter-spacing: -0.01em;
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+        }
+
+        .spark .name .score {
+          color: var(--muted);
+          font-weight: 500;
+        }
+
+        @media (max-width: 640px) {
+          .page {
+            padding: 24px 14px 48px;
+          }
+          .hero {
+            flex-direction: column;
+          }
+          .btn-primary {
+            width: 100%;
+          }
+          h1 {
+            font-size: 24px;
+          }
+        }
       `}</style>
     </main>
   );
 }
 
 function Spark({ model, history }: { model: string; history: Run[] }) {
-  // Oldest → newest, 1 = valid JSON, 0 = fail. Green bars pass, red fail.
   const series = [...history].reverse().map((run) => {
     const r = run.results.find((x) => x.model === model);
     return r ? (r.ok ? 1 : 0) : -1;
   });
-  const w = 190, h = 34, n = series.length, bw = n ? w / n : w;
+  const w = 182;
+  const h = 36;
+  const n = series.length;
+  const bw = n ? w / n : w;
   const okCount = series.filter((v) => v === 1).length;
   const total = series.filter((v) => v >= 0).length;
+  const pct = total ? Math.round((100 * okCount) / total) : 0;
+
   return (
     <div className="spark">
-      <div className="name">{model} · {total ? Math.round((100 * okCount) / total) : 0}%</div>
-      <svg width={w} height={h}>
+      <div className="name">
+        <span>{model}</span>
+        <span className="score">{pct}%</span>
+      </div>
+      <svg width="100%" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" height={h}>
         {series.map((v, i) => (
-          <rect key={i} x={i * bw} y={v === 1 ? h * 0.15 : h * 0.5} width={Math.max(1, bw - 1)}
-            height={v === 1 ? h * 0.85 : h * 0.5}
-            fill={v === 1 ? "#4ade80" : v === 0 ? "#f87171" : "#2b3444"} />
+          <rect
+            key={i}
+            x={i * bw}
+            y={v === 1 ? h * 0.12 : h * 0.48}
+            width={Math.max(1.5, bw - 1.5)}
+            height={v === 1 ? h * 0.88 : h * 0.52}
+            rx={1.5}
+            fill={v === 1 ? "#16a34a" : v === 0 ? "#dc2626" : "#e4e4e7"}
+          />
         ))}
       </svg>
     </div>

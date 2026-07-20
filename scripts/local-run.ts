@@ -17,11 +17,10 @@ async function main() {
   loadEnv();
   const key = process.env.SURPLUS_API_KEY;
   if (!key) throw new Error("SURPLUS_API_KEY not set (env or .env.local)");
-  const run = await runAll(key);
-  console.log(`\nrun @ ${new Date(run.at).toISOString()}\n`);
   const pad = (s: string, n: number) => (s + " ".repeat(n)).slice(0, n);
   console.log(pad("model", 24), pad("json", 5), pad("think", 12), pad("ttft", 7), pad("tok/s", 7), pad("dur", 7), pad("out(r)", 12), "note");
-  for (const r of run.results) {
+  const t0 = Date.now();
+  const run = await runAll(key, (r, done, total) => {
     const think = r.thinking ? (r.thinkingVisible ? "brain seen" : "brain hidden") : "none";
     console.log(
       pad(r.model, 24),
@@ -31,9 +30,10 @@ async function main() {
       pad(String(r.tokPerSec ?? "-"), 7),
       pad(r.duration + "s", 7),
       pad(`${r.tokensOut}(${r.reasoningTokens})`, 12),
-      r.error ?? ""
+      `${r.error ?? ""}  [${done}/${total} · ${((Date.now() - t0) / 1000).toFixed(1)}s]`,
     );
-  }
+  });
+  console.log(`\nrun @ ${new Date(run.at).toISOString()} · wall ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
   // Force exit: hung marketplace sockets can keep the event loop alive even
   // after every attempt has timed out and results are printed.
   process.exit(0);
