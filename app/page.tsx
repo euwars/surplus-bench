@@ -507,16 +507,9 @@ export default function Page() {
                             <span className="dash">—</span>
                           )}
                         </td>
-                        <td
-                          className="note"
-                          title={
-                            isLive
-                              ? "In flight…"
-                              : (row.result?.error ?? undefined)
-                          }
-                        >
-                          {isLive ? "In flight…" : (row.result?.error ?? "")}
-                        </td>
+                        <NoteCell
+                          text={isLive ? "In flight…" : (row.result?.error ?? "")}
+                        />
                       </tr>
                     );
                   })}
@@ -1044,10 +1037,44 @@ export default function Page() {
         .note {
           color: var(--muted);
           font-size: 12px;
-          max-width: 200px;
+          max-width: 220px;
+          cursor: default;
+          outline: none;
+        }
+
+        .note-text {
+          display: block;
+          max-width: 220px;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+
+        .note:hover .note-text,
+        .note:focus .note-text {
+          color: var(--fg);
+        }
+
+        /* Fixed so it isn't clipped by the table's overflow-x scroll container. */
+        .note-tip {
+          position: fixed;
+          z-index: 50;
+          transform: translateY(calc(-100% - 8px));
+          max-width: min(420px, calc(100vw - 24px));
+          padding: 10px 12px;
+          border: 1px solid var(--border);
+          border-radius: var(--radius-sm);
+          background: var(--card);
+          color: var(--fg);
+          font-size: 12px;
+          font-weight: 400;
+          line-height: 1.45;
+          white-space: pre-wrap;
+          word-break: break-word;
+          box-shadow:
+            0 4px 12px rgba(0, 0, 0, 0.08),
+            0 1px 2px rgba(0, 0, 0, 0.04);
+          pointer-events: none;
         }
 
         .rel {
@@ -1157,6 +1184,39 @@ export default function Page() {
         }
       `}</style>
     </main>
+  );
+}
+
+function NoteCell({ text }: { text: string }) {
+  const [tip, setTip] = useState<{ left: number; top: number } | null>(null);
+  if (!text) return <td className="note" />;
+
+  return (
+    <td
+      className="note"
+      onMouseEnter={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        setTip({ left: r.left, top: r.top });
+      }}
+      onMouseLeave={() => setTip(null)}
+      onFocus={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        setTip({ left: r.left, top: r.top });
+      }}
+      onBlur={() => setTip(null)}
+      tabIndex={0}
+    >
+      <span className="note-text">{text}</span>
+      {tip && (
+        <span
+          className="note-tip"
+          role="tooltip"
+          style={{ left: tip.left, top: tip.top }}
+        >
+          {text}
+        </span>
+      )}
+    </td>
   );
 }
 
