@@ -34,6 +34,8 @@ const FAIL_KIND_LABEL: Record<string, string> = {
 };
 interface Run {
   at: number;
+  startedAt?: number;
+  source?: "cron" | "manual" | "cli";
   results: Result[];
 }
 interface Data {
@@ -98,8 +100,6 @@ type ProgressEvent =
   | { type: "skipped"; run: Run }
   | { type: "error"; error: string };
 
-const STALE_MS = 10 * 60 * 1000;
-
 export default function Page() {
   const [data, setData] = useState<Data | null>(null);
   const [running, setRunning] = useState(false);
@@ -151,7 +151,8 @@ export default function Page() {
     );
 
     try {
-      const res = await fetch("/api/run", { cache: "no-store" });
+      // POST = explicit manual run. Cron uses GET and is not kicked from the UI.
+      const res = await fetch("/api/run", { method: "POST", cache: "no-store" });
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
         throw new Error(text || `Run failed (${res.status})`);
@@ -249,12 +250,7 @@ export default function Page() {
     load();
   }, [load]);
 
-  // Auto-run when missing/stale.
-  useEffect(() => {
-    if (!data || runningRef.current) return;
-    const age = data.latest ? data.now - data.latest.at : Infinity;
-    if (age > STALE_MS) trigger();
-  }, [data, trigger]);
+  // No auto-run on stale/missing data — only Vercel cron (GET) or "Run now" (POST).
 
   // Tick elapsed while running.
   useEffect(() => {
@@ -380,7 +376,7 @@ export default function Page() {
               ignored strict schema, not that the model “is dumb.”
             </p>
           </div>
-          <button className="btn-primary" onClick={() => trigger()} disabled={running || !data}>
+          <button className="btn-primary" onClick={() => trigger()} disabled={running}>
             {running ? (
               <>
                 <span className="spinner" />
@@ -402,9 +398,12 @@ export default function Page() {
                 {running
                   ? `Running · ${elapsed.toFixed(1)}s`
                   : age === null
-                    ? "No data"
+                    ? "No data · click Run now or wait for cron"
                     : `Updated ${fmtAge(age)} ago`}
               </span>
+              {!running && data?.latest?.source && (
+                <span className="pill muted-pill">via {data.latest.source}</span>
+              )}
               {running ? (
                 <>
                   <span className="pill">

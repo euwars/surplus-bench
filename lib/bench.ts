@@ -538,15 +538,25 @@ async function benchOne(model: string, key: string): Promise<Result> {
   return attempt(model, key);
 }
 
+export type RunSource = "cron" | "manual" | "cli";
+
 export interface Run {
+  /** Finish time (ms). Legacy field used by the UI as "updated at". */
   at: number;
+  /** Wall-clock start of this run (ms). Optional on older history rows. */
+  startedAt?: number;
+  /** Who kicked the run. Optional on older history rows. */
+  source?: RunSource;
   results: Result[];
 }
 
 export async function runAll(
   key: string,
   onResult?: (result: Result, done: number, total: number) => void,
+  opts?: { source?: RunSource; startedAt?: number },
 ): Promise<Run> {
+  const startedAt = opts?.startedAt ?? Date.now();
+  const source = opts?.source ?? "cli";
   const total = MODELS.length;
   let done = 0;
   const results = await Promise.all(
@@ -557,5 +567,5 @@ export async function runAll(
       return result;
     }),
   );
-  return { at: Date.now(), results };
+  return { at: Date.now(), startedAt, source, results };
 }

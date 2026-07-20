@@ -12,9 +12,9 @@ tracks, per model:
   **see** the reasoning stream. The same reasoning effort is requested for every
   model so the comparison is fair.
 
-The page loads instantly from stored results; the backend refreshes on a cron.
-On first deploy with no data, the UI kicks a run itself and shows live status,
-a per-model table, and reliability sparklines over history.
+The page loads instantly from stored results. The backend refreshes on a Vercel
+cron (`GET /api/run` every 10 minutes, UTC). The **Run now** button uses
+`POST /api/run`. The UI does not auto-start runs on load or stale data.
 
 No provider pinning — requests hit Surplus's default routing, with one retry on
 a transient marketplace blip.
@@ -49,7 +49,7 @@ npm run bench      # one benchmark pass printed to the terminal
 1. Import this GitHub repo at [vercel.com/new](https://vercel.com/new).
 2. Add `SURPLUS_API_KEY` under Environment Variables.
 3. Deploy. `vercel.json` already registers the every-10-minute cron
-   (`/api/run`). Every `git push` redeploys.
+   (`GET /api/run`). Every `git push` redeploys.
 
 ### Persistent history (optional)
 

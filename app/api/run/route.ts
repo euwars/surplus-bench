@@ -1,4 +1,4 @@
-import { runAll, type ProgressEvent } from "@/lib/bench";
+import { runAll, type ProgressEvent, type RunSource } from "@/lib/bench";
 import { MODELS, REASONING_EFFORT } from "@/lib/models";
 import { saveRun, getLatest } from "@/lib/store";
 
@@ -8,25 +8,30 @@ export const runtime = "nodejs";
 export const maxDuration = 120;
 export const dynamic = "force-dynamic";
 
-// Streams NDJSON progress events so the UI can update model-by-model.
-// Cron still works: it just ignores intermediate lines and the final save still happens.
-export async function GET() {
+function ndjson(event: ProgressEvent, status = 200) {
+  return new Response(JSON.stringify(event) + "\n", {
+    status,
+    headers: {
+      "Content-Type": "application/x-ndjson",
+      "Cache-Control": "no-store",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+async function handleRun(source: RunSource) {
   const key = process.env.SURPLUS_API_KEY;
   if (!key) {
-    return new Response(JSON.stringify({ error: "SURPLUS_API_KEY not set" }) + "\n", {
-      status: 500,
-      headers: { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store" },
-    });
+    return ndjson({ type: "error", error: "SURPLUS_API_KEY not set" }, 500);
   }
 
+  // Debounce double-fires (cron + stray click within 60s).
   const latest = await getLatest();
   if (latest && Date.now() - latest.at < 60_000) {
-    const skipped: ProgressEvent = { type: "skipped", run: latest };
-    return new Response(JSON.stringify(skipped) + "\n", {
-      headers: { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store" },
-    });
+    return ndjson({ type: "skipped", run: latest });
   }
 
+  const startedAt = Date.now();
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
@@ -37,12 +42,16 @@ export async function GET() {
         send({
           type: "start",
           models: MODELS,
-          at: Date.now(),
+          at: startedAt,
           reasoningEffort: REASONING_EFFORT,
         });
-        const run = await runAll(key, (result, done, total) => {
-          send({ type: "result", result, done, total });
-        });
+        const run = await runAll(
+          key,
+          (result, done, total) => {
+            send({ type: "result", result, done, total });
+          },
+          { source, startedAt },
+        );
         await saveRun(run);
         send({ type: "done", run });
       } catch (e: any) {
@@ -57,8 +66,17 @@ export async function GET() {
     headers: {
       "Content-Type": "application/x-ndjson",
       "Cache-Control": "no-store",
-      // Disable proxy buffering so progress lines flush promptly.
       "X-Accel-Buffering": "no",
     },
   });
+}
+
+/** Vercel Cron — GET /api/run on the schedule in vercel.json. */
+export async function GET() {
+  return handleRun("cron");
+}
+
+/** Explicit "Run now" from the dashboard. UI never auto-calls this. */
+export async function POST() {
+  return handleRun("manual");
 }
