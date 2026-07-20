@@ -18,7 +18,8 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 // still apples-to-apples, much less thinking-token burn before JSON.
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
-// Long structured report: need room for ~1–2k content tokens plus thinking.
+// Content + thinking budget. Prompt length targets keep content ~2–4k tokens so
+// verbose models (e.g. Gemini Pro) finish JSON before this wall.
 export const MAX_OUTPUT_TOKENS = 8000;
 
 // Parallel per-model wall clock. Longer generation needs more headroom.
@@ -28,36 +29,70 @@ export const TIMEOUT_MS = 180_000;
 import { jsonSchema, type Schema } from "ai";
 import { z } from "zod";
 
-// ─── Source of truth ─────────────────────────────────────────────────────────
-// Edit TaskSchema only. SYSTEM, PROMPT, SCHEMA_KEYS, and the provider JSON
-// schema are derived from it so prompt text and validation cannot drift.
+// ─── Source of truth: length policy ──────────────────────────────────────────
+// Edit LENGTH / COUNTS only. TaskSchema, SYSTEM, PROMPT, and SCHEMA_KEYS are
+// derived from them so prompt text and validation cannot drift.
+//
+// Units are characters (not tokens) — easy for models to follow and for us to
+// enforce. min = hard Zod fail if short. max = soft target in the prompt only
+// (we do not fail long answers; max caps verbosity so outputs finish complete).
+
+type CharRange = { min: number; max: number };
+type CountRange = { min: number; max: number };
+
+/** Per-string character targets. */
+export const LENGTH = {
+  company: { min: 1, max: 80 },
+  executiveSummary: { min: 400, max: 700 },
+  heading: { min: 3, max: 60 },
+  analysis: { min: 250, max: 450 },
+  bullet: { min: 40, max: 90 },
+  title: { min: 3, max: 60 },
+  detail: { min: 200, max: 350 },
+  recommendation: { min: 80, max: 140 },
+} as const satisfies Record<string, CharRange>;
+
+/** Array item-count targets. Prefer min===max so models do not over-produce. */
+export const COUNTS = {
+  sections: { min: 8, max: 8 },
+  bullets: { min: 4, max: 4 },
+  risks: { min: 6, max: 6 },
+  recommendations: { min: 8, max: 8 },
+} as const satisfies Record<string, CountRange>;
+
+function zChars(range: CharRange) {
+  // Only min is enforced. max is prompt guidance (see lengthTargetsText).
+  return z.string().min(range.min);
+}
 
 /** Throughput-oriented structured task: force a large JSON payload so tok/s
  *  is measured over hundreds of content tokens, not a 40-token extraction. */
 export const TaskSchema = z.object({
-  company: z.string().min(1),
+  company: zChars(LENGTH.company),
   stage: z.enum(["preSeed", "seed", "seriesA", "seriesB", "later"]),
   raiseUsd: z.number(),
-  executiveSummary: z.string().min(400),
+  executiveSummary: zChars(LENGTH.executiveSummary),
   sections: z
     .array(
       z.object({
-        heading: z.string().min(3),
-        analysis: z.string().min(250),
-        bullets: z.array(z.string().min(40)).min(4),
+        heading: zChars(LENGTH.heading),
+        analysis: zChars(LENGTH.analysis),
+        bullets: z.array(zChars(LENGTH.bullet)).min(COUNTS.bullets.min),
       }),
     )
-    .min(8),
+    .min(COUNTS.sections.min),
   risks: z
     .array(
       z.object({
-        title: z.string().min(3),
+        title: zChars(LENGTH.title),
         severity: z.enum(["low", "medium", "high"]),
-        detail: z.string().min(200),
+        detail: zChars(LENGTH.detail),
       }),
     )
-    .min(6),
-  recommendations: z.array(z.string().min(80)).min(8),
+    .min(COUNTS.risks.min),
+  recommendations: z
+    .array(zChars(LENGTH.recommendation))
+    .min(COUNTS.recommendations.min),
 });
 
 export type Task = z.infer<typeof TaskSchema>;
@@ -111,10 +146,6 @@ export function toProviderJsonSchema(node: JsonSchemaNode): JsonSchemaNode {
   if (typeof out.minItems === "number" && out.minItems > 1) {
     out.minItems = 1;
   }
-  if (typeof out.maxItems === "number" && out.maxItems > 1) {
-    // Keep maxItems only if providers tolerate it; strip if we see failures.
-    // Currently leave as-is — the 400 we hit is minItems-only.
-  }
 
   if (out.properties) {
     out.properties = Object.fromEntries(
@@ -148,91 +179,42 @@ export const TaskProviderSchema: Schema<Task> = jsonSchema<Task>(
   },
 );
 
-// ─── Prompt text derived from TaskJsonSchema ─────────────────────────────────
+// ─── Prompt text from LENGTH / COUNTS ────────────────────────────────────────
 
-/** Compact human type line for a single JSON-schema node (not nested objects). */
-function typeLabel(node: JsonSchemaNode): string {
-  const t = Array.isArray(node.type) ? node.type.join("|") : node.type;
-  if (node.enum?.length) {
-    return `one of ${node.enum.map((v) => String(v)).join(" | ")}`;
-  }
-  if (t === "array" && node.items && !Array.isArray(node.items)) {
-    const item = node.items;
-    const minN = typeof node.minItems === "number" ? node.minItems : null;
-    const minPrefix =
-      minN != null ? `array of at least ${minN}` : "array";
-    if (item.enum?.length) {
-      return `${minPrefix} of enum (${item.enum.map(String).join(" | ")})`;
-    }
-    if (item.type === "string") {
-      const each =
-        typeof item.minLength === "number" && item.minLength > 1
-          ? `, each ≥${item.minLength} chars`
-          : "";
-      return `${minPrefix} strings${each}`;
-    }
-    if (item.type === "number" || item.type === "integer") {
-      return `${minPrefix} ${item.type === "integer" ? "integers" : "numbers"}`;
-    }
-    if (item.type === "object" && item.properties) {
-      const fields = Object.entries(item.properties).map(
-        ([k, v]) => `${k} (${typeLabel(v)})`,
-      );
-      return `${minPrefix} objects, each with: ${fields.join(", ")}`;
-    }
-    return `${minPrefix} items (${typeLabel(item)})`;
-  }
-  if (t === "string") {
-    if (typeof node.minLength === "number" && node.minLength > 1) {
-      return `string ≥${node.minLength} chars`;
-    }
-    if (node.minLength === 1) return "non-empty string";
-    return "string";
-  }
-  if (t === "number" || t === "integer") {
-    const bits: string[] = [t === "integer" ? "integer" : "number"];
-    if (typeof node.minimum === "number") bits.push(`≥${node.minimum}`);
-    if (typeof node.maximum === "number") bits.push(`≤${node.maximum}`);
-    return bits.join(" ");
-  }
-  if (t === "boolean") return "boolean";
-  if (t === "object") return "object";
-  return t ?? "value";
+function charRange(r: CharRange): string {
+  if (r.min <= 1 && r.max <= 1) return "non-empty string";
+  if (r.min <= 1) return `string, up to ${r.max} chars`;
+  if (r.min === r.max) return `string, exactly ~${r.min} chars`;
+  return `string, ${r.min}–${r.max} chars`;
 }
 
-function describeNode(node: JsonSchemaNode, indent = ""): string {
-  if (node.type !== "object" || !node.properties) return typeLabel(node);
-
-  return Object.entries(node.properties)
-    .map(([k, child]) => {
-      // Nested array-of-objects: expand fields on following lines (readable for prompts).
-      if (
-        child.type === "array" &&
-        child.items &&
-        !Array.isArray(child.items) &&
-        child.items.type === "object" &&
-        child.items.properties
-      ) {
-        const minN = typeof child.minItems === "number" ? child.minItems : null;
-        const head =
-          minN != null
-            ? `array of at least ${minN} objects, each with:`
-            : "array of objects, each with:";
-        const fieldLines = Object.entries(child.items.properties).map(
-          ([fk, fv]) => `${indent}    ${fk} (${typeLabel(fv)})`,
-        );
-        return `${indent}- ${k}: ${head}\n${fieldLines.join("\n")}`;
-      }
-      return `${indent}- ${k}: ${typeLabel(child)}`;
-    })
-    .join("\n");
+function countRange(r: CountRange, unit: string): string {
+  if (r.min === r.max) return `exactly ${r.min} ${unit}`;
+  return `${r.min}–${r.max} ${unit}`;
 }
 
-/** Human-readable field requirements, always in sync with TaskSchema. */
-export function schemaRequirementsText(schema: JsonSchemaNode = TaskJsonSchema): string {
+/**
+ * Human-readable length targets (characters + item counts).
+ * min is required for validation; max is a soft cap so models finish JSON.
+ */
+export function lengthTargetsText(): string {
   return (
-    "Requirements (meet every minimum — short answers fail validation):\n" +
-    describeNode(schema)
+    "Length targets (characters, not tokens — count letters/spaces/punctuation). " +
+    "Meet every minimum or validation fails. Stay at or under each maximum so the " +
+    "JSON completes fully; do not pad past the max.\n" +
+    `- company: ${charRange(LENGTH.company)}\n` +
+    `- stage: one of preSeed | seed | seriesA | seriesB | later\n` +
+    `- raiseUsd: number (USD)\n` +
+    `- executiveSummary: ${charRange(LENGTH.executiveSummary)} (a few short paragraphs)\n` +
+    `- sections: ${countRange(COUNTS.sections, "objects")}, each with:\n` +
+    `    heading (${charRange(LENGTH.heading)})\n` +
+    `    analysis (${charRange(LENGTH.analysis)}; ~1–2 paragraphs)\n` +
+    `    bullets (${countRange(COUNTS.bullets, "strings")}, each ${LENGTH.bullet.min}–${LENGTH.bullet.max} chars)\n` +
+    `- risks: ${countRange(COUNTS.risks, "objects")}, each with:\n` +
+    `    title (${charRange(LENGTH.title)})\n` +
+    `    severity (one of low | medium | high)\n` +
+    `    detail (${charRange(LENGTH.detail)}; ~1 paragraph)\n` +
+    `- recommendations: ${countRange(COUNTS.recommendations, "strings")}, each ${LENGTH.recommendation.min}–${LENGTH.recommendation.max} chars`
   );
 }
 
@@ -242,16 +224,16 @@ function buildSystemPrompt(keys: readonly string[]): string {
     "Respond with one JSON object only — no markdown, no ``` fences, no commentary. " +
     `Keys must be exactly: ${keys.join(", ")}. ` +
     "Never rename keys. Never wrap the object in a code block. " +
-    "Write full sentences and long paragraphs so the report is substantial."
+    "Hit the character and item-count targets in the user message — substantial but bounded; do not write endless prose."
   );
 }
 
-function buildUserPrompt(schema: JsonSchemaNode, keys: readonly string[], brief: string): string {
+function buildUserPrompt(keys: readonly string[], brief: string): string {
   return (
-    "Write a long diligence report as a single raw JSON object (no markdown, no fences, no prose outside JSON). " +
+    "Write a diligence report as a single raw JSON object (no markdown, no fences, no prose outside JSON). " +
     `Use exactly these camelCase keys: ${keys.join(", ")}. ` +
     "Do not invent alternate names. " +
-    schemaRequirementsText(schema) +
+    lengthTargetsText() +
     "\nGround the report in this company brief (expand with plausible diligence analysis; do not invent a different company):\n" +
     `"${brief}"`
   );
@@ -260,5 +242,5 @@ function buildUserPrompt(schema: JsonSchemaNode, keys: readonly string[], brief:
 /** System instruction: strict output contract, separate from the user brief. */
 export const SYSTEM = buildSystemPrompt(SCHEMA_KEYS);
 
-/** User prompt — requirements block is generated from TaskSchema. */
-export const PROMPT = buildUserPrompt(TaskJsonSchema, SCHEMA_KEYS, COMPANY_BRIEF);
+/** User prompt — length targets generated from LENGTH / COUNTS. */
+export const PROMPT = buildUserPrompt(SCHEMA_KEYS, COMPANY_BRIEF);
