@@ -37,12 +37,16 @@ import { z } from "zod";
 // about structured-output RELIABILITY and speed — not generation — with low
 // token variance across models and runs. The schema still exercises the pieces
 // weak sellers mishandle: an enum, a number, and an array.
+//
+// Prompt field names MUST match TaskSchema keys exactly. English paraphrases
+// ("company name", "raise amount") train free-form sellers to invent
+// company_name / raise_amount_usd and fail schema validation.
 export const PROMPT =
-  'Extract structured data from this note. ' +
+  'Extract fields company, stage, raiseUsd, risks from this note. ' +
   'Note: "Convexity is an AI-native ERP raising $1,000,000 at the seed stage. ' +
   'Risks: revenue is unverified, and the CTO is still employed at Microsoft." ' +
-  "Return the company name, its stage, the raise amount in USD as a number, " +
-  "and the list of risk flags.";
+  "stage must be one of: preSeed | seed | seriesA | seriesB | later. " +
+  "raiseUsd is a number (USD). risks is a non-empty string array.";
 
 export const TaskSchema = z.object({
   company: z.string(),
@@ -50,3 +54,7 @@ export const TaskSchema = z.object({
   raiseUsd: z.number(),
   risks: z.array(z.string()).min(1),
 });
+
+// Expected top-level keys — used to diagnose "schema ignored" failures where
+// sellers invent names instead of the schema keys.
+export const SCHEMA_KEYS = ["company", "stage", "raiseUsd", "risks"] as const;

@@ -18,15 +18,13 @@ async function main() {
   const key = process.env.SURPLUS_API_KEY;
   if (!key) throw new Error("SURPLUS_API_KEY not set (env or .env.local)");
   const pad = (s: string, n: number) => (s + " ".repeat(n)).slice(0, n);
-  console.log(pad("model", 24), pad("json", 5), pad("think", 12), pad("ttft", 7), pad("tok/s", 7), pad("dur", 7), pad("out(r)", 12), "note");
+  console.log(pad("model", 24), pad("json", 5), pad("think", 8), pad("tok/s", 7), pad("dur", 7), pad("out(r)", 12), "note");
   const t0 = Date.now();
   const run = await runAll(key, (r, done, total) => {
-    const think = r.thinking ? (r.thinkingVisible ? "brain seen" : "brain hidden") : "none";
     console.log(
       pad(r.model, 24),
       pad(r.ok ? "OK" : "FAIL", 5),
-      pad(think, 12),
-      pad(r.ttft !== null ? r.ttft.toFixed(1) + "s" : "-", 7),
+      pad(r.thinking ? "yes" : "no", 8),
       pad(String(r.tokPerSec ?? "-"), 7),
       pad(r.duration + "s", 7),
       pad(`${r.tokensOut}(${r.reasoningTokens})`, 12),

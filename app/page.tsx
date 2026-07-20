@@ -7,6 +7,8 @@ interface Result {
   ok: boolean;
   jsonValid: boolean;
   error: string | null;
+  failKind?: string | null;
+  rawPreview?: string | null;
   finishReason?: string | null;
   ttft: number | null;
   duration: number;
@@ -19,6 +21,17 @@ interface Result {
   tokPerSec: number | null;
   costUSD: number;
 }
+
+const FAIL_KIND_LABEL: Record<string, string> = {
+  schema_mismatch: "Wrong shape",
+  markdown_fence: "Fenced JSON",
+  prose: "Prose",
+  truncated: "Truncated",
+  timeout: "Timeout",
+  empty: "Empty",
+  parse_error: "Bad JSON",
+  error: "Error",
+};
 interface Run {
   at: number;
   results: Result[];
@@ -121,7 +134,7 @@ export default function Page() {
         }
       }
     } catch (e: any) {
-      setRunError(String(e?.message ?? e).slice(0, 200));
+      setRunError(String(e?.message ?? e).slice(0, 2000));
     } finally {
       runningRef.current = false;
       setRunning(false);
@@ -258,7 +271,9 @@ export default function Page() {
             <p className="eyebrow">Surplus · structured output</p>
             <h1>Model benchmark</h1>
             <p className="lede">
-              Reliability, latency, reasoning, and cost — same prompt and schema for every model.
+              Reliability, latency, reasoning, and cost — same prompt and{" "}
+              <code className="inline-code">json_schema</code> for every model. Fail often means the
+              seller ignored strict schema (free-form JSON / prose) rather than a model “being dumb.”
             </p>
           </div>
           <button className="btn-primary" onClick={() => trigger()} disabled={running || !data}>
@@ -390,7 +405,6 @@ export default function Page() {
                     <th>Model</th>
                     <th>Status</th>
                     <th>Think</th>
-                    <th>First tok</th>
                     <th>Tok/s</th>
                     <th>Duration</th>
                     <th>Out (reason)</th>
@@ -430,7 +444,17 @@ export default function Page() {
                             row.result.ok ? (
                               <span className="badge badge-ok">Pass</span>
                             ) : (
-                              <span className="badge badge-fail">Fail</span>
+                              <span className="status-stack">
+                                <span className="badge badge-fail">Fail</span>
+                                {row.result.failKind && (
+                                  <span
+                                    className="badge badge-kind"
+                                    title={row.result.error ?? undefined}
+                                  >
+                                    {FAIL_KIND_LABEL[row.result.failKind] ?? row.result.failKind}
+                                  </span>
+                                )}
+                              </span>
                             )
                           ) : (
                             <span className="badge badge-think">Queued</span>
@@ -442,26 +466,13 @@ export default function Page() {
                           ) : r?.thinking ? (
                             <span
                               className="badge badge-think"
-                              title={
-                                r.thinkingVisible
-                                  ? "Reasons, thinking visible"
-                                  : "Reasons, thinking hidden"
-                              }
+                              title="Reasoning tokens present in usage (non-streaming)"
                             >
-                              {r.thinkingVisible ? "Seen" : "Hidden"}
+                              Yes
                             </span>
                           ) : (
                             <span className="dash">—</span>
                           )}
-                        </td>
-                        <td className="num">
-                          {r && !isLive
-                            ? r.ttft !== null
-                              ? `${r.ttft.toFixed(1)}s`
-                              : "—"
-                            : isStalePrev && r?.ttft != null
-                              ? `${r.ttft.toFixed(1)}s`
-                              : "—"}
                         </td>
                         <td className="num">
                           {!isLive && r ? (r.tokPerSec ?? "—") : isStalePrev ? (r?.tokPerSec ?? "—") : "—"}
@@ -509,6 +520,13 @@ export default function Page() {
                         </td>
                         <NoteCell
                           text={isLive ? "In flight…" : (row.result?.error ?? "")}
+                          detail={
+                            isLive
+                              ? undefined
+                              : row.result?.rawPreview
+                                ? `Raw model output:\n${row.result.rawPreview}`
+                                : undefined
+                          }
                         />
                       </tr>
                     );
@@ -1034,6 +1052,29 @@ export default function Page() {
           border-color: var(--border);
         }
 
+        .badge-kind {
+          color: #9a3412;
+          background: #fff7ed;
+          border-color: #fed7aa;
+          font-weight: 500;
+        }
+
+        .status-stack {
+          display: inline-flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 4px;
+        }
+
+        .inline-code {
+          font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: 12px;
+          background: #f4f4f5;
+          border: 1px solid var(--border);
+          border-radius: 4px;
+          padding: 1px 5px;
+        }
+
         .note {
           color: var(--muted);
           font-size: 12px;
@@ -1187,9 +1228,10 @@ export default function Page() {
   );
 }
 
-function NoteCell({ text }: { text: string }) {
+function NoteCell({ text, detail }: { text: string; detail?: string }) {
   const [tip, setTip] = useState<{ left: number; top: number } | null>(null);
   if (!text) return <td className="note" />;
+  const full = detail ? `${text}\n\n${detail}` : text;
 
   return (
     <td
@@ -1213,7 +1255,7 @@ function NoteCell({ text }: { text: string }) {
           role="tooltip"
           style={{ left: tip.left, top: tip.top }}
         >
-          {text}
+          {full}
         </span>
       )}
     </td>

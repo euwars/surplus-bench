@@ -1,30 +1,46 @@
-import { streamObject, NoObjectGeneratedError } from "ai";
+import { generateObject, NoObjectGeneratedError } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import {
   MODELS,
   SURPLUS_URL,
   PROMPT,
   TaskSchema,
+  SCHEMA_KEYS,
   REASONING_EFFORT,
   MAX_OUTPUT_TOKENS,
   TIMEOUT_MS,
 } from "./models";
+
+export type FailKind =
+  | "timeout"
+  | "truncated"
+  | "markdown_fence"
+  | "schema_mismatch"
+  | "prose"
+  | "empty"
+  | "parse_error"
+  | "error";
 
 export interface Result {
   model: string;
   ok: boolean; // structured output produced and schema-valid
   jsonValid: boolean;
   error: string | null;
-  finishReason: string | null; // stop | length | error | ...
-  ttft: number | null; // seconds to first streamed token
-  duration: number; // seconds, total
+  failKind: FailKind | null;
+  /** raw model text (truncated) so the UI can show what actually came back */
+  rawPreview: string | null;
+  finishReason: string | null; // stop | length | error | timeout | ...
+  /** Not measured with generateObject (no stream). Kept for UI/history compat. */
+  ttft: number | null;
+  duration: number; // seconds, total wall time for the call
   tokensIn: number;
   tokensOut: number;
   reasoningTokens: number;
   thinking: boolean;
+  /** Always false with non-streaming generateObject — no reasoning stream. */
   thinkingVisible: boolean;
   reasoningEffort: string;
-  tokPerSec: number | null;
+  tokPerSec: number | null; // content tokens / duration
   costUSD: number;
 }
 
@@ -45,14 +61,32 @@ function provider(key: string) {
   });
 }
 
-// Pull real usage + text out of NoObjectGeneratedError so a failed row still
-// shows WHY (truncated vs prose vs empty).
+function stripMarkdownFence(text: string): { fenced: boolean; body: string } {
+  const m = text.match(/^```(?:json|JSON)?\s*\n?([\s\S]*?)\n?\s*```\s*$/);
+  if (m) return { fenced: true, body: m[1].trim() };
+  if (/^```/.test(text)) {
+    return {
+      fenced: true,
+      body: text.replace(/^```(?:json|JSON)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim(),
+    };
+  }
+  return { fenced: false, body: text };
+}
+
+/**
+ * Classify WHY structured output failed. Most "similar" failures across models
+ * are the same root cause: the marketplace seller did NOT enforce json_schema,
+ * so the model free-wrote JSON from the English prompt (snake_case keys,
+ * markdown fences) instead of constrained decoding to the schema.
+ */
 function diagnose(e: unknown): {
+  failKind: FailKind;
   finishReason: string | null;
   tokensOut: number;
   reasoningTokens: number;
   costUSD: number;
   note: string;
+  rawPreview: string | null;
 } {
   if (NoObjectGeneratedError.isInstance(e)) {
     const u: any = e.usage ?? {};
@@ -62,34 +96,91 @@ function diagnose(e: unknown): {
       0;
     const text = (e.text ?? "").trim();
     const fr = (e.finishReason as string | undefined) ?? null;
-    const note =
-      fr === "length"
-        ? `truncated at ${MAX_OUTPUT_TOKENS} tok (thought ${reasoningTokens}, no JSON left)`
-        : text
-          ? `non-JSON: ${text.replace(/\s+/g, " ").slice(0, 70)}`
-          : "empty / refusal";
-    return {
+    const usage = {
       finishReason: fr,
       tokensOut: u.outputTokens ?? 0,
       reasoningTokens,
       costUSD: Math.round((u.raw?.cost ?? 0) * 1e6) / 1e6,
-      note,
+      rawPreview: text ? text.slice(0, 2000) : null,
+    };
+
+    if (fr === "length") {
+      return {
+        ...usage,
+        failKind: "truncated",
+        note: `truncated at ${MAX_OUTPUT_TOKENS} tok (thought ${reasoningTokens}) — JSON incomplete`,
+      };
+    }
+    if (!text) {
+      return { ...usage, failKind: "empty", note: "empty / refusal — no content returned" };
+    }
+
+    const { fenced, body } = stripMarkdownFence(text);
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      /* not JSON even after unwrapping */
+    }
+
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const got = Object.keys(parsed as object);
+      const expected = [...SCHEMA_KEYS];
+      const missing = expected.filter((k) => !(k in (parsed as object)));
+      const extra = got.filter((k) => !expected.includes(k as (typeof SCHEMA_KEYS)[number]));
+      const parts = [
+        fenced ? "markdown-fenced JSON" : "JSON",
+        "but wrong shape",
+        `got {${got.join(", ") || "∅"}}`,
+        `need {${expected.join(", ")}}`,
+      ];
+      if (missing.length) parts.push(`missing: ${missing.join(", ")}`);
+      if (extra.length) parts.push(`extra: ${extra.join(", ")}`);
+      parts.push("— seller ignored strict schema");
+      return {
+        ...usage,
+        failKind: "schema_mismatch",
+        note: parts.join(" · "),
+      };
+    }
+
+    if (fenced) {
+      return {
+        ...usage,
+        failKind: "markdown_fence",
+        note: `markdown fence, not parseable JSON — seller ignored strict schema · ${body.slice(0, 2000)}`,
+      };
+    }
+
+    if (!/^\s*[\[{]/.test(text)) {
+      return {
+        ...usage,
+        failKind: "prose",
+        note: `prose, not JSON — seller ignored strict schema · ${text.replace(/\s+/g, " ").slice(0, 2000)}`,
+      };
+    }
+
+    return {
+      ...usage,
+      failKind: "parse_error",
+      note: `invalid JSON · ${text.replace(/\s+/g, " ").slice(0, 2000)}`,
     };
   }
+
   return {
+    failKind: "error",
     finishReason: null,
     tokensOut: 0,
     reasoningTokens: 0,
     costUSD: 0,
-    note: String((e as any)?.message ?? e).replace(/\s+/g, " ").slice(0, 140),
+    note: String((e as any)?.message ?? e).replace(/\s+/g, " ").slice(0, 2000),
+    rawPreview: null,
   };
 }
 
 function failResult(
   model: string,
   t0: number,
-  ttft: number | null,
-  reasoningStreamed: boolean,
   error: string,
   extra?: Partial<Result>,
 ): Result {
@@ -98,9 +189,11 @@ function failResult(
     ok: false,
     jsonValid: false,
     finishReason: null,
-    ttft,
-    thinking: reasoningStreamed,
-    thinkingVisible: reasoningStreamed,
+    failKind: null,
+    rawPreview: null,
+    ttft: null,
+    thinking: false,
+    thinkingVisible: false,
     reasoningEffort: REASONING_EFFORT,
     duration: Math.round(((Date.now() - t0) / 1000) * 10) / 10,
     tokensIn: 0,
@@ -117,16 +210,14 @@ async function attempt(model: string, key: string): Promise<Result> {
   const surplus = provider(key);
   const ctrl = new AbortController();
   const t0 = Date.now();
-  let ttft: number | null = null;
-  let reasoningStreamed = false;
-  let finishReason: string | null = null;
-
   const timeoutMs = TIMEOUT_MS;
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
 
   const work = (async (): Promise<Result> => {
     try {
-      const r = streamObject({
+      // Non-streaming: one request/response. We only care about schema-valid
+      // structured output + usage/latency, not token-by-token TTFT.
+      const r = await generateObject({
         model: surplus(model),
         schema: TaskSchema,
         prompt: PROMPT,
@@ -135,31 +226,10 @@ async function attempt(model: string, key: string): Promise<Result> {
         providerOptions: {
           surplus: { reasoning: { effort: REASONING_EFFORT }, include_reasoning: true },
         },
-        onError: () => {},
       });
 
-      for await (const part of r.fullStream) {
-        if (ctrl.signal.aborted) break;
-        const type = (part as { type: string }).type;
-        if (type.includes("reasoning")) reasoningStreamed = true;
-        if (type === "finish") {
-          finishReason = (part as { finishReason?: string }).finishReason ?? finishReason;
-        }
-        if (ttft === null && (type === "text-delta" || type === "object")) {
-          ttft = (Date.now() - t0) / 1000;
-        }
-      }
-
-      if (ctrl.signal.aborted) {
-        return failResult(model, t0, ttft, reasoningStreamed, `timeout >${timeoutMs / 1000}s`, {
-          finishReason: "timeout",
-        });
-      }
-
-      await r.object;
-      const usage: any = await r.usage;
+      const usage: any = r.usage;
       const duration = (Date.now() - t0) / 1000;
-
       const tokensIn = usage.inputTokens ?? 0;
       const tokensOut = usage.outputTokens ?? 0;
       const reasoningTokens =
@@ -167,23 +237,28 @@ async function attempt(model: string, key: string): Promise<Result> {
         usage.raw?.completion_tokens_details?.reasoning_tokens ??
         0;
       const contentTokens = Math.max(0, tokensOut - reasoningTokens);
-      const genWindow = ttft !== null && duration > ttft ? duration - ttft : duration;
-      const tokPerSec = genWindow > 0.3 ? Math.round(contentTokens / genWindow) : null;
+      const tokPerSec = duration > 0.3 ? Math.round(contentTokens / duration) : null;
       const costUSD = usage.raw?.cost ?? 0;
+      const finishReason =
+        (r as any).finishReason ??
+        (r as any).response?.finishReason ??
+        "stop";
 
       return {
         model,
         ok: true,
         jsonValid: true,
         error: null,
-        finishReason: finishReason ?? "stop",
-        ttft,
+        failKind: null,
+        rawPreview: null,
+        finishReason: String(finishReason),
+        ttft: null,
         duration: Math.round(duration * 10) / 10,
         tokensIn,
         tokensOut,
         reasoningTokens,
-        thinking: reasoningTokens > 0 || reasoningStreamed,
-        thinkingVisible: reasoningStreamed,
+        thinking: reasoningTokens > 0,
+        thinkingVisible: false,
         reasoningEffort: REASONING_EFFORT,
         tokPerSec,
         costUSD: Math.round(costUSD * 1e6) / 1e6,
@@ -194,17 +269,20 @@ async function attempt(model: string, key: string): Promise<Result> {
         e?.name === "AbortError" ||
         String(e?.message ?? "").includes("aborted");
       if (aborted) {
-        return failResult(model, t0, ttft, reasoningStreamed, `timeout >${timeoutMs / 1000}s`, {
+        return failResult(model, t0, `timeout >${timeoutMs / 1000}s`, {
           finishReason: "timeout",
+          failKind: "timeout",
         });
       }
       const d = diagnose(e);
-      return failResult(model, t0, ttft, reasoningStreamed, d.note, {
+      return failResult(model, t0, d.note, {
         finishReason: d.finishReason,
+        failKind: d.failKind,
+        rawPreview: d.rawPreview,
         tokensOut: d.tokensOut,
         reasoningTokens: d.reasoningTokens,
         costUSD: d.costUSD,
-        thinking: d.reasoningTokens > 0 || reasoningStreamed,
+        thinking: d.reasoningTokens > 0,
       });
     }
   })();
@@ -214,8 +292,9 @@ async function attempt(model: string, key: string): Promise<Result> {
     graceTimer = setTimeout(() => {
       ctrl.abort();
       resolve(
-        failResult(model, t0, ttft, reasoningStreamed, `timeout >${timeoutMs / 1000}s`, {
+        failResult(model, t0, `timeout >${timeoutMs / 1000}s`, {
           finishReason: "timeout",
+          failKind: "timeout",
         }),
       );
     }, timeoutMs + 800);
@@ -229,7 +308,6 @@ async function attempt(model: string, key: string): Promise<Result> {
   }
 }
 
-// No retries — next cron/manual run is the re-check. Retries doubled wall time.
 async function benchOne(model: string, key: string): Promise<Result> {
   return attempt(model, key);
 }
