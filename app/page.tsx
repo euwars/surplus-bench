@@ -271,9 +271,9 @@ export default function Page() {
             <p className="eyebrow">Surplus · structured output</p>
             <h1>Model benchmark</h1>
             <p className="lede">
-              Long structured diligence report (same prompt +{" "}
+              Compact structured diligence report (same prompt +{" "}
               <code className="inline-code">json_schema</code> for every model) so tok/s is measured
-              over a large JSON payload — not a tiny extraction. Fail usually means the seller
+              over a real JSON payload — not a tiny extraction. Fail usually means the seller
               ignored strict schema, not that the model “is dumb.”
             </p>
           </div>

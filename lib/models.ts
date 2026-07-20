@@ -18,8 +18,8 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 // still apples-to-apples, much less thinking-token burn before JSON.
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
-// Content + thinking budget. Prompt length targets keep content ~2–4k tokens so
-// most models finish well under this; 20k leaves headroom for Pro-class thinking.
+// Content + thinking budget. Half-size length targets keep content small;
+// 20k still leaves headroom for Pro-class thinking.
 export const MAX_OUTPUT_TOKENS = 20_000;
 
 // Parallel per-model wall clock. Longer generation needs more headroom.
@@ -40,24 +40,24 @@ import { z } from "zod";
 type CharRange = { min: number; max: number };
 type CountRange = { min: number; max: number };
 
-/** Per-string character targets. */
+/** Per-string character targets (~half the original payload). */
 export const LENGTH = {
   company: { min: 1, max: 80 },
-  executiveSummary: { min: 400, max: 700 },
+  executiveSummary: { min: 200, max: 350 },
   heading: { min: 3, max: 60 },
-  analysis: { min: 250, max: 450 },
-  bullet: { min: 40, max: 90 },
+  analysis: { min: 120, max: 220 },
+  bullet: { min: 20, max: 45 },
   title: { min: 3, max: 60 },
-  detail: { min: 200, max: 350 },
-  recommendation: { min: 80, max: 140 },
+  detail: { min: 100, max: 180 },
+  recommendation: { min: 40, max: 70 },
 } as const satisfies Record<string, CharRange>;
 
-/** Array item-count targets. Prefer min===max so models do not over-produce. */
+/** Array item-count targets (~half). Prefer min===max so models do not over-produce. */
 export const COUNTS = {
-  sections: { min: 8, max: 8 },
-  bullets: { min: 4, max: 4 },
-  risks: { min: 6, max: 6 },
-  recommendations: { min: 8, max: 8 },
+  sections: { min: 4, max: 4 },
+  bullets: { min: 2, max: 2 },
+  risks: { min: 3, max: 3 },
+  recommendations: { min: 4, max: 4 },
 } as const satisfies Record<string, CountRange>;
 
 function zChars(range: CharRange) {
@@ -205,15 +205,15 @@ export function lengthTargetsText(): string {
     `- company: ${charRange(LENGTH.company)}\n` +
     `- stage: one of preSeed | seed | seriesA | seriesB | later\n` +
     `- raiseUsd: number (USD)\n` +
-    `- executiveSummary: ${charRange(LENGTH.executiveSummary)} (a few short paragraphs)\n` +
+    `- executiveSummary: ${charRange(LENGTH.executiveSummary)} (1 short paragraph)\n` +
     `- sections: ${countRange(COUNTS.sections, "objects")}, each with:\n` +
     `    heading (${charRange(LENGTH.heading)})\n` +
-    `    analysis (${charRange(LENGTH.analysis)}; ~1–2 paragraphs)\n` +
+    `    analysis (${charRange(LENGTH.analysis)}; a few sentences)\n` +
     `    bullets (${countRange(COUNTS.bullets, "strings")}, each ${LENGTH.bullet.min}–${LENGTH.bullet.max} chars)\n` +
     `- risks: ${countRange(COUNTS.risks, "objects")}, each with:\n` +
     `    title (${charRange(LENGTH.title)})\n` +
     `    severity (one of low | medium | high)\n` +
-    `    detail (${charRange(LENGTH.detail)}; ~1 paragraph)\n` +
+    `    detail (${charRange(LENGTH.detail)}; a few sentences)\n` +
     `- recommendations: ${countRange(COUNTS.recommendations, "strings")}, each ${LENGTH.recommendation.min}–${LENGTH.recommendation.max} chars`
   );
 }
@@ -230,7 +230,7 @@ function buildSystemPrompt(keys: readonly string[]): string {
 
 function buildUserPrompt(keys: readonly string[], brief: string): string {
   return (
-    "Write a diligence report as a single raw JSON object (no markdown, no fences, no prose outside JSON). " +
+    "Write a compact diligence report as a single raw JSON object (no markdown, no fences, no prose outside JSON). " +
     `Use exactly these camelCase keys: ${keys.join(", ")}. ` +
     "Do not invent alternate names. " +
     lengthTargetsText() +
