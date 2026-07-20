@@ -425,8 +425,14 @@ async function attempt(model: string, key: string): Promise<Result> {
         prompt: PROMPT,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         abortSignal: ctrl.signal,
+        // Portable AI SDK effort (openai-compatible → reasoning_effort when
+        // providerOptions does not override).
+        reasoning: REASONING_EFFORT,
+        // openai-compatible maps reasoningEffort → body.reasoning_effort.
+        // Nested { reasoning: { effort } } is only raw passthrough and was
+        // ignored by sellers (Grok low/high dial never moved).
         providerOptions: {
-          surplus: { reasoning: { effort: REASONING_EFFORT }, include_reasoning: true },
+          surplus: { reasoningEffort: REASONING_EFFORT },
         },
         // Accept valid JSON that models wrap in ```json fences or a bit of prose.
         // Still fails if the unwrapped object doesn't match TaskSchema.

@@ -16,6 +16,8 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 
 // Same effort for every model. "low" is the fast path for frequent updates —
 // still apples-to-apples, much less thinking-token burn before JSON.
+// Sent as AI SDK reasoning + providerOptions.surplus.reasoningEffort →
+// OpenAI-compatible body field reasoning_effort (not nested reasoning.effort).
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
 // Content + thinking budget. Half-size length targets keep content small;
