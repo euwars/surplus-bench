@@ -16,8 +16,12 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 
 // Same effort for every model. "low" is the fast path for frequent updates —
 // still apples-to-apples, much less thinking-token burn before JSON.
-// Sent as AI SDK reasoning + providerOptions.surplus.reasoningEffort →
-// OpenAI-compatible body field reasoning_effort (not nested reasoning.effort).
+// Sent in BOTH wire shapes (body.reasoning_effort AND reasoning:{effort}) since
+// sellers disagree on which they honor — see providerOptions in bench.ts.
+// Caveats (probed 2026-07): claude-* sellers never enable/report thinking under
+// any shape (incl. Anthropic thinking passthrough) — they run thinking-off.
+// gpt-5.5 / gemini-3-5-flash list no reasoning params — they think regardless
+// and the effort dial is a no-op for them.
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
 // Content + thinking budget. Half-size length targets keep content small;

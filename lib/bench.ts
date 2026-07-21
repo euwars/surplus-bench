@@ -428,11 +428,17 @@ async function attempt(model: string, key: string): Promise<Result> {
         // Portable AI SDK effort (openai-compatible → reasoning_effort when
         // providerOptions does not override).
         reasoning: REASONING_EFFORT,
-        // openai-compatible maps reasoningEffort → body.reasoning_effort.
-        // Nested { reasoning: { effort } } is only raw passthrough and was
-        // ignored by sellers (Grok low/high dial never moved).
+        // Send BOTH wire shapes — Surplus sellers disagree on which one they
+        // support (per /models supported_parameters): flat reasoning_effort
+        // (kimi, terra/sol, claude) vs OpenRouter-style reasoning:{effort}
+        // (gpt-5.4, gpt-5.4-mini, grok list only this one). Sellers ignore the
+        // shape they don't know; none 400 on the extra key (probed 2026-07).
+        // reasoningEffort → body.reasoning_effort; reasoning is raw passthrough.
         providerOptions: {
-          surplus: { reasoningEffort: REASONING_EFFORT },
+          surplus: {
+            reasoningEffort: REASONING_EFFORT,
+            reasoning: { effort: REASONING_EFFORT },
+          },
         },
         // Accept valid JSON that models wrap in ```json fences or a bit of prose.
         // Still fails if the unwrapped object doesn't match TaskSchema.

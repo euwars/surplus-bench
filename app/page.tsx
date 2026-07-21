@@ -55,6 +55,7 @@ type SortKey =
   | "duration"
   | "tokensOut"
   | "cost"
+  | "costPerMTok"
   | "reliability"
   | "note";
 
@@ -68,6 +69,7 @@ const SORT_COLUMNS: { key: SortKey; label: string; align?: "left" | "right" }[] 
   { key: "duration", label: "Duration", align: "right" },
   { key: "tokensOut", label: "Out (reason)", align: "right" },
   { key: "cost", label: "Cost", align: "right" },
+  { key: "costPerMTok", label: "$/M tok", align: "right" },
   { key: "reliability", label: "Reliability" },
   { key: "note", label: "Note" },
 ];
@@ -81,6 +83,7 @@ const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = {
   duration: "asc",
   tokensOut: "desc",
   cost: "asc",
+  costPerMTok: "asc",
   reliability: "desc",
   note: "asc",
 };
@@ -326,6 +329,8 @@ export default function Page() {
           return r?.tokensOut ?? null;
         case "cost":
           return r?.costUSD ?? null;
+        case "costPerMTok":
+          return costPerMTok(r);
         case "reliability":
           return rel && rel.total ? rel.ok / rel.total : null;
         case "note":
@@ -628,6 +633,12 @@ export default function Page() {
                           )}
                         </td>
                         <td className="num">{!isLive && r ? fmtCost(r.costUSD) : "—"}</td>
+                        <td
+                          className="num"
+                          title="Effective rate: call cost ÷ output tokens billed (content + reasoning), per 1M"
+                        >
+                          {!isLive && r ? fmtPerMTok(costPerMTok(r)) : "—"}
+                        </td>
                         <td>
                           {relPct !== null ? (
                             <span className="rel">
@@ -1477,6 +1488,23 @@ function fmtAge(s: number) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   return `${Math.round(s / 3600)}h`;
+}
+
+/**
+ * Effective $ per 1M output tokens for one call: cost ÷ tokens billed out
+ * (content + reasoning). Normalizes cost across models that burn very
+ * different token counts for the same task.
+ */
+function costPerMTok(r: Result | null): number | null {
+  if (!r || !(r.costUSD > 0) || !(r.tokensOut > 0)) return null;
+  return (r.costUSD / r.tokensOut) * 1e6;
+}
+
+function fmtPerMTok(v: number | null) {
+  if (v == null || !Number.isFinite(v)) return "—";
+  if (v >= 100) return `$${v.toFixed(0)}`;
+  if (v >= 10) return `$${v.toFixed(1)}`;
+  return `$${v.toFixed(2)}`;
 }
 
 /** Show small per-call costs (often well under $0.01). */
