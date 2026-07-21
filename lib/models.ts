@@ -10,6 +10,9 @@ export const MODELS = [
   "gpt-5.5",
   "gemini-3-5-flash",
   "grok-4.5",
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "glm-5.2",
 ];
 
 export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
