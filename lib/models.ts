@@ -21,7 +21,9 @@ export const SURPLUS_URL = "https://api.surplusintelligence.ai/v1";
 // Caveats (probed 2026-07): claude-* sellers never enable/report thinking under
 // any shape (incl. Anthropic thinking passthrough) — they run thinking-off.
 // gpt-5.5 / gemini-3-5-flash list no reasoning params — they think regardless
-// and the effort dial is a no-op for them.
+// and the effort dial is a no-op for them. gpt-5.4-mini lists reasoning:{effort}
+// but ignores it (low vs high vs none all ~150–390 reasoning tok on a fixed
+// probe) — its 1.5–5k reasoning burn on this task is run-to-run variance.
 export const REASONING_EFFORT: "low" | "medium" | "high" = "low";
 
 // Content + thinking budget. Half-size length targets keep content small;
